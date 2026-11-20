@@ -1,0 +1,2299 @@
+================================================================
+AETHERIUM OVERLORD — ПОЛНЫЙ ДИЗАЙН-ДОКУМЕНТ И ШАБЛОН МОДА
+Minecraft Forge 1.20.1 (47.x) | Java 17 | GeckoLib 4 | Curios 5 | FTB Quests
+================================================================
+
+СОДЕРЖАНИЕ
+ 1. Мана и Пути развития (код + древа прокачки)
+ 2. Арсенал: 25 посохов + базовый класс MagicStaffItem
+ 3. Концепция 100+ предметов
+ 4. Концепция 100+ блоков
+ 5. 3D-модели и анимации (GeckoLib / Blockbench)
+ 6. Квесты и прогрессия (FTB Quests, SNBT)
+ 7. Генерация мира и структуры
+ 8. Крафты и шаблон кода регистрации
+ 9. Сборка через GitHub Actions
+
+Соглашения: пакет com.aetherium.overlord, MODID = "aetherium_overlord".
+Все Java-файлы ниже лежат в src/main/java/com/aetherium/overlord/...
+
+================================================================
+РАЗДЕЛ 1. МАНА И ПУТИ РАЗВИТИЯ
+================================================================
+
+--- 1.1 Java-код системы маны ---
+
+// ===== capability/MagicPath.java =====
+package com.aetherium.overlord.capability;
+
+public enum MagicPath {
+    NONE("Без пути", 0xFFFFFF),
+    PYROMANCER("Пиромант", 0xFF5A1F),
+    NECROMANCER("Некромант", 0x7B2CBF),
+    CHRONOMANCER("Хрономант", 0x2EC4F1),
+    DRUID("Друид", 0x4CAF50);
+
+    public final String title;
+    public final int color;
+
+    MagicPath(String title, int color) {
+        this.title = title;
+        this.color = color;
+    }
+
+    public static MagicPath byId(int id) {
+        MagicPath[] v = values();
+        return id >= 0 && id < v.length ? v[id] : NONE;
+    }
+}
+
+// ===== capability/PlayerMana.java =====
+package com.aetherium.overlord.capability;
+
+import net.minecraft.nbt.CompoundTag;
+import net.minecraftforge.common.util.INBTSerializable;
+
+public class PlayerMana implements INBTSerializable<CompoundTag> {
+    private float mana = 100f;
+    private float baseMax = 100f;
+    private float regenPerSecond = 2f;
+    private MagicPath path = MagicPath.NONE;
+    private int pathLevel = 0;
+    private int pathPoints = 0;
+    private float lastSynced = -1f;
+    // не сохраняется: считается каждый тик из брони/артефактов (1.0 = без бонуса, 6.0 = +500%)
+    private float maxMultiplier = 1f;
+
+    public float getMana() { return mana; }
+    public float getEffectiveMax() { return baseMax * maxMultiplier; }
+    public float getBaseMax() { return baseMax; }
+    public float getRegen() { return regenPerSecond * (1f + (maxMultiplier - 1f) * 0.2f); }
+    public MagicPath getPath() { return path; }
+    public int getPathLevel() { return pathLevel; }
+    public int getPathPoints() { return pathPoints; }
+    public boolean isPathChosen() { return path != MagicPath.NONE; }
+
+    public void setMaxMultiplier(float m) { this.maxMultiplier = Math.max(1f, m); }
+
+    public void setPath(MagicPath p) {
+        if (this.path == MagicPath.NONE) {
+            this.path = p;
+            this.pathLevel = 1;
+            this.baseMax += 25f;
+        }
+    }
+
+    public boolean consume(float amount) {
+        if (mana < amount) return false;
+        mana -= amount;
+        return true;
+    }
+
+    public void addMana(float amount) { mana = Math.min(getEffectiveMax(), mana + amount); }
+
+    public void addPathPoints(int pts) { pathPoints += pts; }
+
+    /** Прокачка: тратит очки, +25 к лимиту маны и +0.25 к регену за уровень. */
+    public boolean levelUp() {
+        int cost = pathLevel + 1;
+        if (pathLevel >= 10 || pathPoints < cost) return false;
+        pathPoints -= cost;
+        pathLevel++;
+        baseMax += 25f;
+        regenPerSecond += 0.25f;
+        return true;
+    }
+
+    public void tick() {
+        float max = getEffectiveMax();
+        if (mana < max) mana = Math.min(max, mana + getRegen() / 20f);
+        if (mana > max) mana = max;
+    }
+
+    /** true, если значение изменилось и пора слать пакет клиенту */
+    public boolean needsSync() {
+        if (Math.abs(mana - lastSynced) >= 0.5f) { lastSynced = mana; return true; }
+        return false;
+    }
+    public void forceSync() { lastSynced = -1f; }
+
+    public void copyFrom(PlayerMana o) {
+        this.mana = o.mana; this.baseMax = o.baseMax; this.regenPerSecond = o.regenPerSecond;
+        this.path = o.path; this.pathLevel = o.pathLevel; this.pathPoints = o.pathPoints;
+    }
+
+    @Override
+    public CompoundTag serializeNBT() {
+        CompoundTag t = new CompoundTag();
+        t.putFloat("mana", mana);
+        t.putFloat("baseMax", baseMax);
+        t.putFloat("regen", regenPerSecond);
+        t.putInt("path", path.ordinal());
+        t.putInt("level", pathLevel);
+        t.putInt("points", pathPoints);
+        return t;
+    }
+
+    @Override
+    public void deserializeNBT(CompoundTag t) {
+        mana = t.getFloat("mana");
+        baseMax = t.contains("baseMax") ? t.getFloat("baseMax") : 100f;
+        regenPerSecond = t.contains("regen") ? t.getFloat("regen") : 2f;
+        path = MagicPath.byId(t.getInt("path"));
+        pathLevel = t.getInt("level");
+        pathPoints = t.getInt("points");
+    }
+}
+
+// ===== capability/ModCapabilities.java =====
+package com.aetherium.overlord.capability;
+
+import net.minecraftforge.common.capabilities.Capability;
+import net.minecraftforge.common.capabilities.CapabilityManager;
+import net.minecraftforge.common.capabilities.CapabilityToken;
+
+public class ModCapabilities {
+    public static final Capability<PlayerMana> PLAYER_MANA =
+            CapabilityManager.get(new CapabilityToken<>() {});
+}
+
+// ===== capability/PlayerManaProvider.java =====
+package com.aetherium.overlord.capability;
+
+import net.minecraft.core.Direction;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraftforge.common.capabilities.Capability;
+import net.minecraftforge.common.capabilities.ICapabilitySerializable;
+import net.minecraftforge.common.util.LazyOptional;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+
+public class PlayerManaProvider implements ICapabilitySerializable<CompoundTag> {
+    private final PlayerMana mana = new PlayerMana();
+    private final LazyOptional<PlayerMana> optional = LazyOptional.of(() -> mana);
+
+    @Override
+    public <T> @NotNull LazyOptional<T> getCapability(@NotNull Capability<T> cap, @Nullable Direction side) {
+        return cap == ModCapabilities.PLAYER_MANA ? optional.cast() : LazyOptional.empty();
+    }
+
+    @Override public CompoundTag serializeNBT() { return mana.serializeNBT(); }
+    @Override public void deserializeNBT(CompoundTag nbt) { mana.deserializeNBT(nbt); }
+}
+
+// ===== network/ModNetwork.java =====
+package com.aetherium.overlord.network;
+
+import com.aetherium.overlord.AetheriumOverlordMod;
+import com.aetherium.overlord.capability.ModCapabilities;
+import net.minecraft.resources.ResourceLocation;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraftforge.network.NetworkRegistry;
+import net.minecraftforge.network.PacketDistributor;
+import net.minecraftforge.network.simple.SimpleChannel;
+
+public class ModNetwork {
+    private static final String PROTOCOL = "1";
+    public static final SimpleChannel CHANNEL = NetworkRegistry.newSimpleChannel(
+            new ResourceLocation(AetheriumOverlordMod.MODID, "main"),
+            () -> PROTOCOL, PROTOCOL::equals, PROTOCOL::equals);
+
+    public static void register() {
+        int id = 0;
+        CHANNEL.registerMessage(id++, ManaSyncPacket.class,
+                ManaSyncPacket::encode, ManaSyncPacket::decode, ManaSyncPacket::handle);
+        CHANNEL.registerMessage(id++, ChoosePathPacket.class,
+                ChoosePathPacket::encode, ChoosePathPacket::decode, ChoosePathPacket::handle);
+    }
+
+    public static void syncMana(ServerPlayer player) {
+        player.getCapability(ModCapabilities.PLAYER_MANA).ifPresent(m ->
+                CHANNEL.send(PacketDistributor.PLAYER.with(() -> player),
+                        new ManaSyncPacket(m.getMana(), m.getEffectiveMax(),
+                                m.getPath().ordinal(), m.getPathLevel(), m.getPathPoints())));
+    }
+}
+
+// ===== network/ManaSyncPacket.java =====
+package com.aetherium.overlord.network;
+
+import com.aetherium.overlord.client.ClientManaData;
+import net.minecraft.network.FriendlyByteBuf;
+import net.minecraftforge.api.distmarker.Dist;
+import net.minecraftforge.fml.DistExecutor;
+import net.minecraftforge.network.NetworkEvent;
+import java.util.function.Supplier;
+
+public record ManaSyncPacket(float mana, float max, int path, int level, int points) {
+    public static void encode(ManaSyncPacket p, FriendlyByteBuf buf) {
+        buf.writeFloat(p.mana); buf.writeFloat(p.max);
+        buf.writeInt(p.path); buf.writeInt(p.level); buf.writeInt(p.points);
+    }
+    public static ManaSyncPacket decode(FriendlyByteBuf buf) {
+        return new ManaSyncPacket(buf.readFloat(), buf.readFloat(), buf.readInt(), buf.readInt(), buf.readInt());
+    }
+    public static void handle(ManaSyncPacket p, Supplier<NetworkEvent.Context> ctx) {
+        ctx.get().enqueueWork(() -> DistExecutor.unsafeRunWhenOn(Dist.CLIENT,
+                () -> () -> ClientManaData.set(p.mana, p.max, p.path, p.level, p.points)));
+        ctx.get().setPacketHandled(true);
+    }
+}
+
+// ===== network/ChoosePathPacket.java =====
+package com.aetherium.overlord.network;
+
+import com.aetherium.overlord.capability.MagicPath;
+import com.aetherium.overlord.capability.ModCapabilities;
+import com.aetherium.overlord.item.PathTomeItem;
+import net.minecraft.network.FriendlyByteBuf;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraftforge.network.NetworkEvent;
+import java.util.function.Supplier;
+
+public record ChoosePathPacket(int path) {
+    public static void encode(ChoosePathPacket p, FriendlyByteBuf buf) { buf.writeInt(p.path); }
+    public static ChoosePathPacket decode(FriendlyByteBuf buf) { return new ChoosePathPacket(buf.readInt()); }
+
+    public static void handle(ChoosePathPacket p, Supplier<NetworkEvent.Context> ctx) {
+        ctx.get().enqueueWork(() -> {
+            ServerPlayer player = ctx.get().getSender();
+            if (player == null || !(player.getMainHandItem().getItem() instanceof PathTomeItem)) return;
+            MagicPath chosen = MagicPath.byId(p.path);
+            if (chosen == MagicPath.NONE) return;
+            player.getCapability(ModCapabilities.PLAYER_MANA).ifPresent(m -> {
+                if (m.isPathChosen()) return;
+                m.setPath(chosen);
+                m.addPathPoints(1);
+                m.forceSync();
+                player.getMainHandItem().shrink(1);
+                ModNetwork.syncMana(player);
+            });
+        });
+        ctx.get().setPacketHandled(true);
+    }
+}
+
+// ===== events/ManaEvents.java =====  (Forge event bus)
+package com.aetherium.overlord.events;
+
+import com.aetherium.overlord.AetheriumOverlordMod;
+import com.aetherium.overlord.capability.*;
+import com.aetherium.overlord.network.ModNetwork;
+import net.minecraft.resources.ResourceLocation;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.player.Player;
+import net.minecraftforge.event.AttachCapabilitiesEvent;
+import net.minecraftforge.event.TickEvent;
+import net.minecraftforge.event.entity.player.PlayerEvent;
+import net.minecraftforge.eventbus.api.SubscribeEvent;
+import net.minecraftforge.fml.common.Mod;
+
+@Mod.EventBusSubscriber(modid = AetheriumOverlordMod.MODID)
+public class ManaEvents {
+
+    @SubscribeEvent
+    public static void attach(AttachCapabilitiesEvent<Entity> e) {
+        if (e.getObject() instanceof Player) {
+            e.addCapability(new ResourceLocation(AetheriumOverlordMod.MODID, "mana"), new PlayerManaProvider());
+        }
+    }
+
+    @SubscribeEvent
+    public static void clone(PlayerEvent.Clone e) {
+        e.getOriginal().reviveCaps();
+        e.getOriginal().getCapability(ModCapabilities.PLAYER_MANA).ifPresent(old ->
+                e.getEntity().getCapability(ModCapabilities.PLAYER_MANA).ifPresent(n -> n.copyFrom(old)));
+        e.getOriginal().invalidateCaps();
+    }
+
+    @SubscribeEvent
+    public static void tick(TickEvent.PlayerTickEvent e) {
+        if (e.phase != TickEvent.Phase.END || e.player.level().isClientSide) return;
+        e.player.getCapability(ModCapabilities.PLAYER_MANA).ifPresent(m -> {
+            m.setMaxMultiplier(ArmorBonuses.manaMultiplier(e.player)); // см. раздел 3
+            m.tick();
+            if (e.player.tickCount % 10 == 0 && m.needsSync()) ModNetwork.syncMana((ServerPlayer) e.player);
+        });
+    }
+
+    @SubscribeEvent
+    public static void login(PlayerEvent.PlayerLoggedInEvent e) {
+        if (e.getEntity() instanceof ServerPlayer sp) { sp.getCapability(ModCapabilities.PLAYER_MANA).ifPresent(PlayerMana::forceSync); ModNetwork.syncMana(sp); }
+    }
+    @SubscribeEvent
+    public static void respawn(PlayerEvent.PlayerRespawnEvent e) {
+        if (e.getEntity() instanceof ServerPlayer sp) ModNetwork.syncMana(sp);
+    }
+    @SubscribeEvent
+    public static void dimension(PlayerEvent.PlayerChangedDimensionEvent e) {
+        if (e.getEntity() instanceof ServerPlayer sp) ModNetwork.syncMana(sp);
+    }
+}
+
+// ===== events/ArmorBonuses.java =====  (заглушка: +500% маны за сет Архимага)
+package com.aetherium.overlord.events;
+
+import com.aetherium.overlord.registry.ModItems;
+import net.minecraft.world.entity.EquipmentSlot;
+import net.minecraft.world.entity.player.Player;
+
+public class ArmorBonuses {
+    public static float manaMultiplier(Player p) {
+        boolean full = p.getItemBySlot(EquipmentSlot.HEAD).is(ModItems.ARCHMAGE_HELMET.get())
+                && p.getItemBySlot(EquipmentSlot.CHEST).is(ModItems.ARCHMAGE_CHESTPLATE.get())
+                && p.getItemBySlot(EquipmentSlot.LEGS).is(ModItems.ARCHMAGE_LEGGINGS.get())
+                && p.getItemBySlot(EquipmentSlot.FEET).is(ModItems.ARCHMAGE_BOOTS.get());
+        return full ? 6f : 1f; // 6.0 = +500%
+    }
+}
+// (ARCHMAGE_* регистрируются так же, как остальная броня; в шаблоне раздела 8 они упомянуты для компиляции — добавьте их в ModItems по образцу.)
+
+// ===== events/ModBusEvents.java =====  (MOD event bus)
+package com.aetherium.overlord.events;
+
+import com.aetherium.overlord.AetheriumOverlordMod;
+import com.aetherium.overlord.capability.PlayerMana;
+import net.minecraftforge.common.capabilities.RegisterCapabilitiesEvent;
+import net.minecraftforge.eventbus.api.SubscribeEvent;
+import net.minecraftforge.fml.common.Mod;
+
+@Mod.EventBusSubscriber(modid = AetheriumOverlordMod.MODID, bus = Mod.EventBusSubscriber.Bus.MOD)
+public class ModBusEvents {
+    @SubscribeEvent
+    public static void registerCaps(RegisterCapabilitiesEvent e) { e.register(PlayerMana.class); }
+}
+
+// ===== client/ClientManaData.java =====
+package com.aetherium.overlord.client;
+
+public class ClientManaData {
+    public static float mana, max = 100f;
+    public static int path, level, points;
+    public static void set(float m, float mx, int p, int l, int pts) { mana = m; max = mx; path = p; level = l; points = pts; }
+}
+
+// ===== client/ManaHud.java =====  (кастомная полоска маны)
+package com.aetherium.overlord.client;
+
+import com.aetherium.overlord.AetheriumOverlordMod;
+import com.aetherium.overlord.capability.MagicPath;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.GuiGraphics;
+import net.minecraftforge.api.distmarker.Dist;
+import net.minecraftforge.client.event.RegisterGuiOverlaysEvent;
+import net.minecraftforge.client.gui.overlay.VanillaGuiOverlay;
+import net.minecraftforge.eventbus.api.SubscribeEvent;
+import net.minecraftforge.fml.common.Mod;
+
+@Mod.EventBusSubscriber(modid = AetheriumOverlordMod.MODID, bus = Mod.EventBusSubscriber.Bus.MOD, value = Dist.CLIENT)
+public class ManaHud {
+
+    @SubscribeEvent
+    public static void register(RegisterGuiOverlaysEvent e) {
+        e.registerAbove(VanillaGuiOverlay.PLAYER_HEALTH.id(), "mana_bar", (gui, g, partialTick, w, h) -> {
+            Minecraft mc = Minecraft.getInstance();
+            if (mc.player == null || mc.options.hideGui || mc.player.isSpectator()) return;
+            draw(g, w, h, mc);
+        });
+    }
+
+    private static void draw(GuiGraphics g, int w, int h, Minecraft mc) {
+        int barW = 81, barH = 7;
+        int x = w / 2 - 91, y = h - 59;
+        float ratio = ClientManaData.max <= 0 ? 0 : Math.min(1f, ClientManaData.mana / ClientManaData.max);
+        int color = 0xFF000000 | MagicPath.byId(ClientManaData.path).color;
+        if (ClientManaData.path == 0) color = 0xFF3A7BFF;
+
+        g.fill(x - 1, y - 1, x + barW + 1, y + barH + 1, 0xFF101018);   // рамка
+        g.fill(x, y, x + barW, y + barH, 0xFF1C1C2A);                   // фон
+        int filled = (int) (barW * ratio);
+        g.fill(x, y, x + filled, y + barH, color);                       // заполнение
+        g.fill(x, y, x + filled, y + 2, 0x66FFFFFF);                     // блик
+        String text = (int) ClientManaData.mana + " / " + (int) ClientManaData.max;
+        g.drawString(mc.font, text, x + barW + 4, y, 0xFFE8E8FF, true);
+        if (ClientManaData.path != 0) {
+            g.drawString(mc.font, MagicPath.byId(ClientManaData.path).title + " ур." + ClientManaData.level
+                    + "  [очки: " + ClientManaData.points + "]", x, y - 10, color, true);
+        }
+    }
+}
+
+// ===== item/PathTomeItem.java =====  (Фолиант Выбора Пути)
+package com.aetherium.overlord.item;
+
+import com.aetherium.overlord.client.ClientHooks;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.InteractionResultHolder;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.Level;
+import net.minecraftforge.api.distmarker.Dist;
+import net.minecraftforge.fml.DistExecutor;
+
+public class PathTomeItem extends Item {
+    public PathTomeItem(Properties p) { super(p.stacksTo(1)); }
+
+    @Override
+    public InteractionResultHolder<ItemStack> use(Level level, Player player, InteractionHand hand) {
+        if (level.isClientSide) DistExecutor.unsafeRunWhenOn(Dist.CLIENT, () -> ClientHooks::openPathScreen);
+        return InteractionResultHolder.sidedSuccess(player.getItemInHand(hand), level.isClientSide);
+    }
+}
+
+// ===== client/ClientHooks.java =====
+package com.aetherium.overlord.client;
+
+import net.minecraft.client.Minecraft;
+
+public class ClientHooks {
+    public static void openPathScreen() { Minecraft.getInstance().setScreen(new PathSelectScreen()); }
+}
+
+// ===== client/PathSelectScreen.java =====
+package com.aetherium.overlord.client;
+
+import com.aetherium.overlord.capability.MagicPath;
+import com.aetherium.overlord.network.ChoosePathPacket;
+import com.aetherium.overlord.network.ModNetwork;
+import net.minecraft.client.gui.GuiGraphics;
+import net.minecraft.client.gui.components.Button;
+import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.network.chat.Component;
+
+public class PathSelectScreen extends Screen {
+    public PathSelectScreen() { super(Component.literal("Выбор Пути Магии")); }
+
+    @Override
+    protected void init() {
+        int y = this.height / 2 - 40;
+        for (MagicPath p : MagicPath.values()) {
+            if (p == MagicPath.NONE) continue;
+            addRenderableWidget(Button.builder(Component.literal(p.title), b -> {
+                ModNetwork.CHANNEL.sendToServer(new ChoosePathPacket(p.ordinal()));
+                onClose();
+            }).bounds(this.width / 2 - 70, y, 140, 20).build());
+            y += 26;
+        }
+    }
+
+    @Override
+    public void render(GuiGraphics g, int mx, int my, float pt) {
+        renderBackground(g);
+        g.drawCenteredString(this.font, "Выбери свой Путь. Выбор необратим!", this.width / 2, this.height / 2 - 65, 0xFFD700);
+        super.render(g, mx, my, pt);
+    }
+
+    @Override public boolean isPauseScreen() { return false; }
+}
+
+--- 1.2 Механика прокачки пути ---
+ • Уровни пути: 1–10. Стоимость уровня N = N очков пути (ур.1→2 стоит 2, ... 9→10 стоит 10).
+ • Очки пути: награды квестов, Осколки Пути (предмет), убийство боссов (+3..+10).
+ • Каждый уровень: +25 к макс. мане, +0.25 маны/сек. Сет Архимага: +500% лимита маны.
+ • Выбор пути — один раз, через Фолиант Выбора Пути (крафт: книга + 4 эссенции, либо стартовый предмет через FTB Quests).
+ • Посох чужого пути работает только в творческом режиме либо с Руной Универсала (крафт в Столе начертания).
+
+--- 1.3 Четыре Пути ---
+
+=== ПУТЬ 1: ПИРОМАНТ / РАЗРУШИТЕЛЬ (цвет: оранжевый) ===
+Стиль: максимальный урон по площади, риск и награда.
+Древо прокачки:
+ Ур.1  Искра — +10% урона огнём, базовые посохи Пути.
+ Ур.2  Тепло Очага — враги рядом (3 бл.) получают поджог.
+ Ур.3  Огнеупорность — полный иммунитет к огню и лаве.
+ Ур.4  Магмовый След — за вами остаётся горящий след (урон 2/с).
+ Ур.5  Щит Пепла — поглощает до 8 урона раз в 30 с.
+ Ур.6  Жар Души — огненные заклинания +30% радиус.
+ Ур.7  Метеорная Метка — каждое 5-е заклинание вызывает малый метеор.
+ Ур.8  Феникс — при смерти воскрешает (КД 20 минут), взрыв радиус 6.
+ Ур.9  Сердце Вулкана — регенерация маны x2 в Незере и около огня.
+ Ур.10 УЛЬТИМЕЙТ «Метеоритный Апокалипсис»: 12 метеоритов в радиусе 20 бл. на 15 с (урон 40 каждый). Затраты 400 маны, КД 3 минуты.
+Пассивки (всегда): +20% ко всему огненному урону; враги в огне получают -15% брони.
+
+=== ПУТЬ 2: НЕКРОМАНТ / ПОВЕЛИТЕЛЬ БЕЗДНЫ (цвет: фиолетовый) ===
+Стиль: армия миньонов, выживаемость, контроль.
+ Ур.1  Шёпот Могил — вампиризм 10% от магического урона.
+ Ур.2  Слуга Праха — лимит миньонов 2.
+ Ур.3  Проклятие Слабости — цель наносит -30% урона 10 с.
+ Ур.4  Тёмные Узы — миньоны получают вашу броню x0.5.
+ Ур.5  Пожиратель — убийство даёт +4 маны и +2 HP.
+ Ур.6  Чумная Аура — враги рядом получают отравление, миньоны не страдают.
+ Ур.7  Командир Мёртвых — лимит миньонов 6, миньоны сильнее на 50%.
+ Ур.8  Проклятие Увядания — цель теряет 8% макс. HP/с 5 с.
+ Ур.9  Бессмертный Лич — смертельный урон вместо смерти: 3 с неуязвимости, -50% маны (КД 15 мин).
+ Ур.10 УЛЬТИМЕЙТ «Врата Бездны»: вызывает Бездонного Жнеца на 60 с (босс-миньон) + 10 скелетов-воинов. Затраты 450 маны, КД 4 минуты.
+Пассивки: миньоны не атакуют владельца; +1 миньон за каждые 2 уровня после 7-го; вампиризм растёт с уровнем.
+
+=== ПУТЬ 3: ХРОНОМАНТ / МАГ ПРОСТРАНСТВА (цвет: голубой) ===
+Стиль: мобильность, контроль времени, телепорты.
+ Ур.1  Ускорение — Скорость I вне боя.
+ Ур.2  Блинк — телепорт на 6 блоков (КД 5 с).
+ Ур.3  Тормоз Времени — удар посохом замедляет цель (Замедление II 3 с).
+ Ур.4  Лёгкая Поступь — нет урона от падения.
+ Ур.5  Пузырь Времени — враги в радиусе 5 вокруг цели движутся на 50% медленнее.
+ Ур.6  Эфирный Полёт — полёт на 30 с (расходует 2 маны/с).
+ Ур.7  Откат — раз в минуту возврат на позицию 5 с назад с восстановлением HP.
+ Ур.8  Космический Шаг — блинк до 24 блоков, оставляет портал (союзники входят).
+ Ур.9  Время — Союзник — кулдауны всех посохов -30%.
+ Ур.10 УЛЬТИМЕЙТ «Остановка Мира»: все враги в радиусе 25 бл. замирают на 8 с, вы действуете x2 быстрее. Затраты 500 маны, КД 5 минут.
+Пассивки: кулдауны всех заклинаний Пути -10%; уклонение 10%.
+
+=== ПУТЬ 4: ДРУИД / ХРАНИТЕЛЬ ПРИРОДЫ (цвет: зелёный) ===
+Стиль: поддержка, лечение, контроль территории.
+ Ур.1  Дыхание Леса — естественная регенерация x1.5.
+ Ур.2  Целебный Росток — заклинание лечения 4 HP.
+ Ур.3  Корни — удерживают врагов 4 с (корни рядом с деревом/травой — 6 с).
+ Ур.4  Кора — Сопротивление I на траве.
+ Ур.5  Шторм — изменение погоды (дождь/гроза/ясно) на 2 мин.
+ Ур.6  Рой — вызывает пчёл-союзников (урон + отравление).
+ Ур.7  Зелёная Вспышка — баффы союзникам (Сила, Регенерация) на 60 с.
+ Ур.8  Страж Рощи — призыв Энта (танк, 60 с).
+ Ур.9  Дар Жизни — воскрешает союзника в радиусе 10 бл. (КД 10 мин).
+ Ур.10 УЛЬТИМЕЙТ «Расцвет Природы»: радиус 20 бл. — лечение союзников 100%, корни на врагов 10 с, цветочное поле, регенерация II 30 с. Затраты 450 маны, КД 4 минуты.
+Пассивки: +20% лечения; растения и мобы-животные не атакуют вас.
+
+================================================================
+РАЗДЕЛ 2. АРСЕНАЛ: 25 ПОСОХОВ
+================================================================
+Обозначения: Мана = ПКМ / Shift+ПКМ. КД = ПКМ / Shift+ПКМ (в секундах).
+Ульт-посохи (Shift) требуют уровень пути не ниже указанного.
+
+ №  Название                          Путь     Мана     КД         ПКМ (обычный каст)                      Shift+ПКМ (ультимейт)
+ 1  Деревянный посох ученика          Нейтрал  5/40     1/20       Магическая искра (3 урона)               Вспышка света: слепота в радиусе 5
+ 2  Посох Тлеющего Угля               Пиро     10/60    1.5/25     Огненный шарик                           Огненное кольцо r=4
+ 3  Посох Магмового Ядра              Пиро     15/90    2/30       Магма-снаряд, лужа лавы 3 с              Извержение под целью
+ 4  Посох Огненного Феникса           Пиро     20/150   2/40       Птица-снаряд (пробивает)                 Огненное Возрождение: взрыв r=6 + поджог
+ 5  Посох Метеора                     Пиро     30/250   3/60       Малый метеорит в цель                    Метеоритный дождь (8 метеоров)
+ 6  Посох Звёздопада Разрушителя      Пиро     40/400   3/180      Огненный луч 20 бл.                      Апокалипсис (ультимейт Пути)
+ 7  Костяной посох Послушника         Некро    10/60    1.5/25     Теневой болт + вампиризм 20%             2 скелета-слуги на 60 с
+ 8  Посох Шепчущих Душ                Некро    15/90    2/30       Проклятие Слабости                       3 Векса-призрака
+ 9  Посох Кровавой Жатвы              Некро    20/150   2/40       Кровавая стрела, крадёт 4 HP             Кровавая сфера: массовый вампиризм r=8
+ 10 Посох Повелителя Склепа           Некро    30/250   3/60       Волна костей (конус)                     Армия мёртвых: 6 бойцов на 90 с
+ 11 Посох Бездны                      Некро    40/450   3/240      Чёрная дыра затягивает врагов            Врата Бездны (ультимейт Пути)
+ 12 Песочный посох Новичка            Хроно    10/60    1/20       Замедляющая искра                        Короткий блинк 8 бл.
+ 13 Посох Тикающих Шестерён           Хроно    15/90    2/30       Замедление группы, сбивает снаряды       Пузырь времени r=6, 5 с
+ 14 Посох Вечного Мига                Хроно    20/150   2/40       Телепорт-удар в цель (16 бл.)            Откат на позицию 5 с назад
+ 15 Посох Пространственного Разлома   Хроно    30/250   3/60       Разрез пространства — урон линией        Телепорт союзников к вам
+ 16 Посох Хроноса                     Хроно    40/500   3/300      Остановка одной цели 3 с                 Остановка Мира (ультимейт Пути)
+ 17 Посох-Росток Ученика              Друид    10/60    1.5/25     Лечащий росток +4 HP                     Корни держат врагов 4 с
+ 18 Посох Живой Коры                  Друид    15/90    2/30       Шипастая лоза (урон)                     Роща исцеления r=6
+ 19 Посох Грозового Дуба              Друид    20/150   2/40       Молния в цель                            Управление погодой (гроза)
+ 20 Посох Хранителя Леса              Друид    30/250   3/60       Рой пчёл                                 Призыв Энта на 60 с
+ 21 Посох Древа Жизни                 Друид    40/450   3/240      Массовое лечение r=10                    Расцвет Природы (ультимейт Пути)
+ 22 Посох Эфирного Странника          Любой    25/200   2/60       Переключаемые режимы (Shift+колесо)      Комбо-каст четырёх стихий
+ 23 Посох Архимага                    Любой    35/300   2/90       Хаотический залп из 5 снарядов           Взрыв маны: r=10, урон = % маны
+ 24 Посох Падшего Бога Эфира          Любой    50/500   3/180      Луч эфира 30 бл., прожигает броню        Казнь: убивает моба до 30% HP мгновенно
+ 25 Посох Создателя Миров             Любой    60/800   4/600      Сотворение: платформа/мост из блоков     Творение: смена биома r=30 + удар 4 стихий
+
+--- 2.1 Базовый класс MagicStaffItem ---
+
+// ===== item/MagicStaffItem.java =====
+package com.aetherium.overlord.item;
+
+import com.aetherium.overlord.capability.MagicPath;
+import com.aetherium.overlord.capability.ModCapabilities;
+import com.aetherium.overlord.capability.PlayerMana;
+import com.aetherium.overlord.entity.MagicBoltProjectile;
+import com.aetherium.overlord.network.ModNetwork;
+import net.minecraft.core.particles.ParticleOptions;
+import net.minecraft.network.chat.Component;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.InteractionResultHolder;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.phys.Vec3;
+
+import java.util.Optional;
+
+public abstract class MagicStaffItem extends Item {
+    protected final MagicPath path;
+    protected final int tier;
+    protected final float manaCost, ultimateCost;
+    protected final int cooldown, ultimateCooldown;   // в тиках
+
+    public MagicStaffItem(Properties props, MagicPath path, int tier,
+                          float manaCost, int cooldownTicks, float ultimateCost, int ultimateCooldownTicks) {
+        super(props); // в Properties задавайте .durability(N) (это уже даёт стак 1)
+        this.path = path; this.tier = tier;
+        this.manaCost = manaCost; this.cooldown = cooldownTicks;
+        this.ultimateCost = ultimateCost; this.ultimateCooldown = ultimateCooldownTicks;
+    }
+
+    /** ПКМ. Вернуть true, если заклинание сработало. */
+    protected abstract boolean castPrimary(ServerLevel level, ServerPlayer player, ItemStack stack);
+    /** Shift+ПКМ. */
+    protected abstract boolean castUltimate(ServerLevel level, ServerPlayer player, ItemStack stack);
+
+    @Override
+    public InteractionResultHolder<ItemStack> use(Level level, Player player, InteractionHand hand) {
+        ItemStack stack = player.getItemInHand(hand);
+        if (level.isClientSide) return InteractionResultHolder.sidedSuccess(stack, true);
+        if (player.getCooldowns().isOnCooldown(this)) return InteractionResultHolder.fail(stack);
+
+        ServerPlayer sp = (ServerPlayer) player;
+        ServerLevel sl = (ServerLevel) level;
+        Optional<PlayerMana> opt = sp.getCapability(ModCapabilities.PLAYER_MANA).resolve();
+        if (opt.isEmpty()) return InteractionResultHolder.fail(stack);
+        PlayerMana mana = opt.get();
+
+        boolean creative = sp.isCreative();
+        if (!creative && path != MagicPath.NONE && mana.getPath() != path) {
+            sp.displayClientMessage(Component.literal("§cЭтот посох принадлежит Пути: " + path.title), true);
+            return InteractionResultHolder.fail(stack);
+        }
+
+        boolean ult = sp.isShiftKeyDown();
+        float cost = ult ? ultimateCost : manaCost;
+        if (!creative && !mana.consume(cost)) {
+            sp.displayClientMessage(Component.literal("§9Не хватает маны (" + (int) cost + ")"), true);
+            return InteractionResultHolder.fail(stack);
+        }
+
+        boolean ok = ult ? castUltimate(sl, sp, stack) : castPrimary(sl, sp, stack);
+        if (!ok) {
+            if (!creative) mana.addMana(cost); // возврат
+            return InteractionResultHolder.fail(stack);
+        }
+        stack.hurtAndBreak(ult ? 3 : 1, sp, p -> p.broadcastBreakEvent(hand));
+        sp.getCooldowns().addCooldown(this, ult ? ultimateCooldown : cooldown);
+        ModNetwork.syncMana(sp);
+        return InteractionResultHolder.sidedSuccess(stack, false);
+    }
+
+    /** Выстрел кастомным снарядом из глаз игрока. */
+    protected void shootBolt(ServerLevel level, ServerPlayer player, float damage, float aoeRadius,
+                             ParticleOptions particle, float speed) {
+        Vec3 look = player.getLookAngle();
+        MagicBoltProjectile bolt = new MagicBoltProjectile(level, player, look.x, look.y, look.z);
+        bolt.setPos(player.getX() + look.x, player.getEyeY() - 0.1 + look.y, player.getZ() + look.z);
+        bolt.configure(damage, aoeRadius, particle, path);
+        bolt.shoot(look.x, look.y, look.z, speed, 0f);
+        level.addFreshEntity(bolt);
+    }
+
+    protected float scaledDamage(float base) { return base * (1f + tier * 0.35f); }
+
+    public MagicPath getPath() { return path; }
+    public int getTier() { return tier; }
+}
+
+// ===== entity/MagicBoltProjectile.java =====
+package com.aetherium.overlord.entity;
+
+import com.aetherium.overlord.capability.MagicPath;
+import com.aetherium.overlord.registry.ModEntities;
+import net.minecraft.core.particles.ParticleOptions;
+import net.minecraft.core.particles.ParticleTypes;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.damagesource.DamageSource;
+import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.projectile.AbstractHurtingProjectile;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.phys.EntityHitResult;
+import net.minecraft.world.phys.HitResult;
+import net.minecraft.world.phys.AABB;
+
+public class MagicBoltProjectile extends AbstractHurtingProjectile {
+    private float damage = 6f, aoe = 0f;
+    private ParticleOptions particle = ParticleTypes.ENCHANT;
+    private MagicPath element = MagicPath.NONE;
+    private int life = 0;
+
+    public MagicBoltProjectile(EntityType<? extends MagicBoltProjectile> type, Level level) { super(type, level); }
+
+    public MagicBoltProjectile(Level level, LivingEntity owner, double dx, double dy, double dz) {
+        super(ModEntities.MAGIC_BOLT.get(), owner, dx, dy, dz, level);
+    }
+
+    public void configure(float damage, float aoe, ParticleOptions particle, MagicPath element) {
+        this.damage = damage; this.aoe = aoe; this.particle = particle; this.element = element;
+    }
+
+    @Override protected ParticleOptions getTrailParticle() { return particle; }
+    @Override protected boolean shouldBurn() { return false; }
+    @Override public boolean isOnFire() { return false; }
+
+    @Override
+    public void tick() {
+        super.tick();
+        if (!level().isClientSide && ++life > 80) discard();
+        if (level().isClientSide) {
+            level().addParticle(particle, getX(), getY(), getZ(), 0, 0, 0);
+        }
+    }
+
+    @Override
+    protected void onHitEntity(EntityHitResult res) {
+        super.onHitEntity(res);
+        if (level().isClientSide) return;
+        res.getEntity().hurt(damageSources().indirectMagic(this, getOwner()), damage);
+        if (element == MagicPath.PYROMANCER) res.getEntity().setSecondsOnFire(4);
+    }
+
+    @Override
+    protected void onHit(HitResult res) {
+        super.onHit(res);
+        if (level().isClientSide) return;
+        if (aoe > 0f) {
+            AABB box = getBoundingBox().inflate(aoe);
+            for (LivingEntity e : level().getEntitiesOfClass(LivingEntity.class, box, e -> e != getOwner())) {
+                e.hurt(damageSources().indirectMagic(this, getOwner()), damage * 0.6f);
+            }
+            ((ServerLevel) level()).sendParticles(particle, getX(), getY(), getZ(), 40, aoe / 2, aoe / 2, aoe / 2, 0.05);
+        }
+        discard();
+    }
+}
+
+// ===== registry/ModEntities.java =====
+package com.aetherium.overlord.registry;
+
+import com.aetherium.overlord.AetheriumOverlordMod;
+import com.aetherium.overlord.entity.MagicBoltProjectile;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.MobCategory;
+import net.minecraftforge.registries.DeferredRegister;
+import net.minecraftforge.registries.RegistryObject;
+
+public class ModEntities {
+    public static final DeferredRegister<EntityType<?>> ENTITIES =
+            DeferredRegister.create(net.minecraftforge.registries.ForgeRegistries.ENTITY_TYPES, AetheriumOverlordMod.MODID);
+
+    public static final RegistryObject<EntityType<MagicBoltProjectile>> MAGIC_BOLT = ENTITIES.register("magic_bolt",
+            () -> EntityType.Builder.<MagicBoltProjectile>of(MagicBoltProjectile::new, MobCategory.MISC)
+                    .sized(0.3f, 0.3f).clientTrackingRange(4).updateInterval(10).build("magic_bolt"));
+}
+
+// Клиентский рендер снаряда (ничего не рисуем, только частицы):
+// ===== client/ClientModEvents.java =====
+package com.aetherium.overlord.client;
+
+import com.aetherium.overlord.AetheriumOverlordMod;
+import com.aetherium.overlord.registry.ModEntities;
+import net.minecraft.client.renderer.entity.NoopRenderer;
+import net.minecraftforge.api.distmarker.Dist;
+import net.minecraftforge.client.event.EntityRenderersEvent;
+import net.minecraftforge.eventbus.api.SubscribeEvent;
+import net.minecraftforge.fml.common.Mod;
+
+@Mod.EventBusSubscriber(modid = AetheriumOverlordMod.MODID, bus = Mod.EventBusSubscriber.Bus.MOD, value = Dist.CLIENT)
+public class ClientModEvents {
+    @SubscribeEvent
+    public static void renderers(EntityRenderersEvent.RegisterRenderers e) {
+        e.registerEntityRenderer(ModEntities.MAGIC_BOLT.get(), NoopRenderer::new);
+    }
+}
+
+// ===== item/ElementalStaff.java =====  (универсальный посох: поведение зависит от Пути)
+package com.aetherium.overlord.item;
+
+import com.aetherium.overlord.capability.MagicPath;
+import net.minecraft.core.particles.ParticleOptions;
+import net.minecraft.core.particles.ParticleTypes;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.effect.MobEffectInstance;
+import net.minecraft.world.effect.MobEffects;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.Mob;
+import net.minecraft.world.entity.monster.Vex;
+import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.Vec3;
+
+public class ElementalStaff extends MagicStaffItem {
+    private final float baseDamage;
+
+    public ElementalStaff(Properties p, MagicPath path, int tier, float mana, int cd, float ultMana, int ultCd, float baseDamage) {
+        super(p, path, tier, mana, cd, ultMana, ultCd);
+        this.baseDamage = baseDamage;
+    }
+
+    private ParticleOptions particle() {
+        return switch (path) {
+            case PYROMANCER -> ParticleTypes.FLAME;
+            case NECROMANCER -> ParticleTypes.SOUL_FIRE_FLAME;
+            case CHRONOMANCER -> ParticleTypes.END_ROD;
+            case DRUID -> ParticleTypes.HAPPY_VILLAGER;
+            default -> ParticleTypes.ENCHANT;
+        };
+    }
+
+    @Override
+    protected boolean castPrimary(ServerLevel level, ServerPlayer player, ItemStack stack) {
+        float aoe = path == MagicPath.PYROMANCER ? 1.5f + tier * 0.4f : 0f;
+        shootBolt(level, player, scaledDamage(baseDamage), aoe, particle(), 1.6f);
+        if (path == MagicPath.NECROMANCER) player.heal(scaledDamage(baseDamage) * 0.15f); // вампиризм
+        if (path == MagicPath.DRUID) player.heal(1f + tier);
+        return true;
+    }
+
+    @Override
+    protected boolean castUltimate(ServerLevel level, ServerPlayer player, ItemStack stack) {
+        double r = 6 + tier * 2;
+        AABB box = player.getBoundingBox().inflate(r);
+        switch (path) {
+            case PYROMANCER -> {
+                // метеоритный дождь: снаряды падают сверху вокруг игрока
+                for (int i = 0; i < 4 + tier * 2; i++) {
+                    double x = player.getX() + (level.random.nextDouble() - 0.5) * r * 2;
+                    double z = player.getZ() + (level.random.nextDouble() - 0.5) * r * 2;
+                    var m = new com.aetherium.overlord.entity.MagicBoltProjectile(level, player, 0, -1, 0);
+                    m.setPos(x, player.getY() + 18, z);
+                    m.configure(scaledDamage(baseDamage) * 2f, 3f, ParticleTypes.LAVA, path);
+                    m.shoot(0, -1, 0, 1.2f, 0f);
+                    level.addFreshEntity(m);
+                }
+            }
+            case NECROMANCER -> {
+                for (int i = 0; i < 2 + tier; i++) {
+                    Vex v = EntityType.VEX.create(level);
+                    if (v == null) continue;
+                    v.moveTo(player.getX() + i - 1, player.getY() + 1, player.getZ());
+                    v.setOwner(player);
+                    v.setLimitedLife(20 * (40 + tier * 10));
+                    level.addFreshEntity(v);
+                }
+            }
+            case CHRONOMANCER -> {
+                for (LivingEntity e : level.getEntitiesOfClass(LivingEntity.class, box, e -> e != player)) {
+                    e.addEffect(new MobEffectInstance(MobEffects.MOVEMENT_SLOWDOWN, 20 * 5, 4));
+                    e.addEffect(new MobEffectInstance(MobEffects.WEAKNESS, 20 * 5, 1));
+                }
+                Vec3 look = player.getLookAngle().scale(8);
+                player.teleportTo(player.getX() + look.x, player.getY(), player.getZ() + look.z); // блинк
+            }
+            case DRUID -> {
+                for (LivingEntity e : level.getEntitiesOfClass(LivingEntity.class, box)) {
+                    if (e == player || e instanceof net.minecraft.world.entity.player.Player) {
+                        e.heal(6f + tier * 2);
+                        e.addEffect(new MobEffectInstance(MobEffects.REGENERATION, 20 * 8, 1));
+                    } else if (e instanceof Mob) {
+                        e.addEffect(new MobEffectInstance(MobEffects.MOVEMENT_SLOWDOWN, 20 * 4, 6)); // корни
+                    }
+                }
+            }
+            default -> {
+                for (LivingEntity e : level.getEntitiesOfClass(LivingEntity.class, box, e -> e != player)) {
+                    e.hurt(player.damageSources().indirectMagic(player, player), scaledDamage(baseDamage));
+                }
+            }
+        }
+        level.sendParticles(particle(), player.getX(), player.getY() + 1, player.getZ(), 80, r / 3, 1, r / 3, 0.05);
+        return true;
+    }
+}
+
+================================================================
+РАЗДЕЛ 3. КОНЦЕПЦИЯ 100+ ПРЕДМЕТОВ (помимо посохов)
+================================================================
+
+--- 3.1 ОРУЖИЕ (24 шт.) ---
+Мечи (8):
+ 1. Эфирный меч — базовый, +урон магией
+ 2. Клинок Тлеющего Угля — поджигает цель
+ 3. Меч Шёпота Бездны — вампиризм 8%
+ 4. Хрономеч — каждый 3-й удар замедляет цель
+ 5. Лезвие Живой Коры — лечит владельца при ударе
+ 6. Лунный Серебряный клинок — +урон нежити
+ 7. Меч Падшего Стража — пробивает броню
+ 8. Клинок Повелителя (Overlord Blade) — стреляет волной маны, Shift: рывок-удар
+Косы (4):
+ 9. Коса Жнеца Душ — урон по площади, +мана за убийство
+ 10. Коса Лунного Серпа — бросается и возвращается
+ 11. Коса Урожая Друида — косит траву/цветы, лечит союзников
+ 12. Коса Хроноса — удар отбрасывает врагов во времени (Замедление)
+Гримуары заклинаний (6) — предмет в левой руке, ПКМ — каст, привязаны к Путям:
+ 13. Гримуар Искры (Пиро) — огненные шары
+ 14. Гримуар Костяной Жатвы (Некро) — призыв миньонов
+ 15. Гримуар Песка Времени (Хроно) — замедление/блинк
+ 16. Гримуар Зелёной Книги (Друид) — лечение, корни
+ 17. Гримуар Запретных Рун — случайное заклинание из любых Путей
+ 18. Гримуар Архимага — 4 заклинания, переключаются колесом мыши
+Луки (6):
+ 19. Эфирный лук — стрелы наводятся на цель
+ 20. Лук Феникса — огненные взрывающиеся стрелы
+ 21. Лук Теней — стрелы с вампиризмом
+ 22. Лук Хроноса — стрелы замедляют/останавливают цель
+ 23. Лук Древа Жизни — стрелы лечат союзников
+ 24. Лук Создателя — бесконечные стрелы за ману
+
+--- 3.2 БРОНЯ: 6 ПОЛНЫХ СЕТОВ = 24 вещи ---
+Каждая вещь: шлем, нагрудник, поножи, ботинки.
+ Сет 1. ПЕПЕЛЬНЫЙ ПИРОМАНТ (Пиро):
+   Бонус за полный комплект: иммунитет к огню и лаве, +30% огненного урона, автощит от огня.
+ Сет 2. САВАН БЕЗДНЫ (Некро):
+   Бонус: невидимость в темноте и на Shift (3 с невидимости раз в 20 с), +15% вампиризма, +2 слота миньонов.
+ Сет 3. ХРОНАЛЬНАЯ ОДЕЖДА (Хроно):
+   Бонус: полёт в творческом стиле (расходует 3 маны/с), -20% КД посохов.
+ Сет 4. ОБЛАЧЕНИЕ ХРАНИТЕЛЯ (Друид):
+   Бонус: регенерация I всегда, лечение союзников +30%, автощит поглощения 10 HP (КД 60 с).
+ Сет 5. ЭФИРНЫЙ АРХИМАГ (универсальный):
+   Бонус: +500% к максимальной мане (код ArmorBonuses), +100% регена маны.
+ Сет 6. ПОКРОВ ПУСТОТЫ (эндгейм, из Энда):
+   Бонус: невидимость + автощит (бьёт врагов током), полёт, иммунитет к урону пустоты и падению.
+Крылья/рога (визуал): шлем Бездны — рога (GeckoLib), нагрудник Хроно и Пустоты — крылья (анимация взмаха).
+
+--- 3.3 ИНСТРУМЕНТЫ (16 шт.) ---
+Кирки:
+ 1. Эфирная кирка (3x3)
+ 2. Кирка Магмового Ядра (3x3, автоплавка руд)
+ 3. Кирка Рудокопа Бездны (5x5, вытягивает жилу)
+ 4. Кирка Создателя (5x5, Shift: 7x7 "вырез")
+Топоры/Лопаты/Мотыги:
+ 5. Топор Лесника Эфира (валит дерево целиком)
+ 6. Лопата Рассвета (3x3 копание)
+ 7. Мотыга Друида (3x3 вспашка, мгновенный рост культур при ПКМ за ману)
+Сканеры, магниты, свет:
+ 8. Рудный сканер Эфира (подсвечивает руды в радиусе 16)
+ 9. Рудный сканер Хроноса (радиус 48, показывает тип)
+ 10. Магнит лута (радиус 8, носится как инструмент)
+ 11. Магнит Бездны (радиус 24, переносит лут в инвентарь)
+ 12. Вечный факел (не гаснет, лампа-посох)
+ 13. Вечный фонарь Друида (светит и растит растения)
+ 14. Мана-ножницы
+ 15. Эфирный рыболовный посох (улов 2x, ману тратит)
+ 16. Телепорт-компас (метка дома, телепорт за ману)
+
+--- 3.4 АРТЕФАКТЫ И РЕЛИКВИИ ДЛЯ CURIOS (26 шт.) ---
+Кольца (slot "ring") — 9:
+ 1. Кольцо Искры (+10% урона огнём)
+ 2. Кольцо Тихой Тени (скрытность)
+ 3. Кольцо Песка Времени (-10% КД)
+ 4. Кольцо Ростка (регенерация)
+ 5. Кольцо Маны I (+50 макс. маны)
+ 6. Кольцо Маны II (+150 макс. маны)
+ 7. Кольцо Архимага (+0.5 маны/с)
+ 8. Кольцо Вампира (вампиризм 5%)
+ 9. Кольцо Повелителя (все эффекты колец слабее x0.5, один слот под всё)
+Амулеты (slot "necklace") — 8:
+ 10. Амулет Пепла (иммунитет к огню)
+ 11. Амулет Души (+1 слот миньона)
+ 12. Амулет Пространства (блинк на Shift+двойной прыжок)
+ 13. Амулет Леса (животные нейтральны)
+ 14. Амулет Эфира (+30% регена маны)
+ 15. Амулет Феникса (авто-воскрешение, расходуется)
+ 16. Амулет Громовой (молния при ударе)
+ 17. Амулет Создателя (все пассивки Пути +20%)
+Пояса (slot "belt") — 5:
+ 18. Пояс Мага (+слот быстрого заклинания)
+ 19. Пояс Выживальщика (насыщение медленнее)
+ 20. Пояс Гравитации (нет падения)
+ 21. Пояс Титана (+4 сердца)
+ 22. Пояс Эфира (рюкзак на 9 слотов)
+Реликвии (slot "charm"/"head"/"back") — 4:
+ 23. Корона Магистра (slot head, +50% маны)
+ 24. Плащ Хроноса (slot back, замедляет снаряды)
+ 25. Сфера Мудрости (slot charm, +XP)
+ 26. Реликвия Древнего Бога (slot charm, редкая награда за квест №25)
+Курьос: слоты создаются через data/aetherium_overlord/curios/slots/*.json и entities/player.json.
+
+--- 3.5 РЕСУРСЫ (22 шт.) ---
+Слитки/камни/зерно:
+ 1. Эфирит (сырой) 2. Эфирный слиток 3. Самоцвет Маны 4. Лунное серебро (слиток)
+ 5. Тлеющий Уголь (слиток из Незера) 6. Осколок Души 7. Кровавая Ржавь (слиток)
+ 8. Эндерит (слиток) 9. Хроно-кристалл 10. Сплав Повелителя (Overlord Alloy)
+Руны:
+ 11. Пустая руна 12. Руна Огня 13. Руна Смерти 14. Руна Времени 15. Руна Жизни 16. Руна Универсала
+Эссенции стихий:
+ 17. Эссенция Огня 18. Эссенция Бездны 19. Эссенция Времени 20. Эссенция Природы
+Свитки и осколки:
+ 21. Свиток телепортации (на домашнюю точку / к игроку)
+ 22. Осколок Пути (+1 очко прокачки пути при использовании)
+
+ИТОГО предметов (без посохов): 24 + 24 + 16 + 26 + 22 = 112. С посохами: 137.
+
+================================================================
+РАЗДЕЛ 4. КОНЦЕПЦИЯ 100+ БЛОКОВ
+================================================================
+
+--- 4.1 РУДЫ И МАТЕРИАЛЫ (20) ---
+Руды:
+ 1. Эфирная руда (Верхний мир)           2. Глубинная эфирная руда
+ 3. Руда Самоцвета Маны                   4. Глубинная руда Самоцвета Маны
+ 5. Руда Лунного Серебра                  6. Рунная каменная руда (даёт пустые руны)
+ 7. Руда Тлеющего Угля (Незер)            8. Руда Осколков Души (Незер)
+ 9. Руда Кровавой Ржави (Незер)           10. Эндеритовая руда (Энд)
+ 11. Руда Хроно-кристалла (Энд)
+Блоки материалов (9):
+ 12. Блок эфирита   13. Блок самоцвета маны   14. Блок лунного серебра   15. Блок тлеющего угля
+ 16. Блок осколков души   17. Блок эндерита   18. Блок хроно-кристалла   19. Блок Сплава Повелителя
+ 20. Блок сырого эфирита
+
+--- 4.2 МАГИЧЕСКИЕ МЕХАНИЗМЫ (15) ---
+ 1. Алтарь слияния (многоблочный крафт: 8 пьедесталов вокруг)
+ 2. Стол начертания рун
+ 3. Обелиск маны I (генерирует 5 маны/с в радиусе 10)
+ 4. Обелиск маны II (15 маны/с)
+ 5. Обелиск маны III (50 маны/с, нужен Эндерит)
+ 6. Зарядный пьедестал (заряжает посохи/артефакты маной)
+ 7. Пьедестал слияния (ставится вокруг алтаря)
+ 8. Рама портала в Эфирное Измерение
+ 9. Портал в Эфирное Измерение (энергия)
+ 10. Алтарь выбора пути (альтернатива фолианту)
+ 11. Кристаллизатор маны (превращает ману в самоцветы)
+ 12. Мана-конденсатор (хранилище маны для механизмов)
+ 13. Алтарь призыва боссов
+ 14. Телепорт-маяк (пары маяков, перемещение по сети)
+ 15. Очиститель проклятий
+
+--- 4.3 СТРОИТЕЛЬНЫЕ И ДЕКОРАТИВНЫЕ БЛОКИ (65) ---
+Зачарованное дерево — полный набор (17):
+ 1. Бревно 2. Очищенное бревно 3. Древесина (wood) 4. Очищенная древесина
+ 5. Доски 6. Ступени 7. Плита 8. Забор 9. Калитка 10. Дверь 11. Люк
+ 12. Кнопка 13. Нажимная плита 14. Табличка 15. Висячая табличка 16. Листва 17. Саженец
+Рунные кирпичи (10):
+ 18. Рунные кирпичи 19. Ступени 20. Плита 21. Стенка 22. Потрескавшиеся
+ 23. Замшелые 24. Резные 25. Колонна 26. Гладкие 27. Светящиеся рунные кирпичи
+Эфирный камень (7):
+ 28. Эфирный камень 29. Ступени 30. Плита 31. Стенка 32. Полированный
+ 33. Полированные ступени 34. Полированные плиты
+Светящиеся кристаллы (12): 4 цвета (синий-мана, красный-огонь, фиолетовый-бездна, зелёный-жизнь):
+ 35-38. Кластеры (4 цвета)  39-42. Блоки кристаллов (4 цвета)  43-46. Кристальные лампы (4 цвета)
+Магическое стекло (8):
+ 47. Магическое стекло 48. Магическая панель 49. Тёмное магическое стекло 50. Тёмная панель
+ 51. Светящееся магическое стекло 52. Светящаяся панель 53. Цветное магическое стекло (универс.) 54. Цветная панель
+Свет и интерьер (7):
+ 55. Рунный фонарь 56. Парящая свеча 57. Магическая люстра 58-61. Магические ковры (4 цвета)
+Растения (4):
+ 62. Эфирный цветок 63. Лунная лилия 64. Мана-мох 65. Светящийся гриб
+
+ИТОГО блоков: 20 + 15 + 65 = 100.
+
+================================================================
+РАЗДЕЛ 5. 3D-МОДЕЛИ И АНИМАЦИИ (GeckoLib / Blockbench)
+================================================================
+
+--- 5.1 ТЕХНИЧЕСКОЕ ЗАДАНИЕ (ТЗ) ДЛЯ ХУДОЖНИКА ---
+Общие требования:
+ • Программа: Blockbench 4.x, формат проекта "GeckoLib Model" (animated model) для предметов/брони/мобов.
+ • Единицы: 1 блок = 16 px. Текстуры PNG, степень двойки: посохи 64x64 (3D) или 128x128 (крупные), броня 128x128, боссы 256x256.
+ • Имена костей (bones) только латиницей, snake_case: root, crystal, crystal_ring_1, head, horns, wing_left, wing_right...
+ • Один-единственный root в корне модели. Центр pivot — в точке вращения кости.
+ • Лимит: посохи ≤ 150 кубов, броня ≤ 400 кубов на комплект, босс ≤ 1200 кубов.
+ • Файлы: geo — assets/<modid>/geo/..., анимации — assets/<modid>/animations/..., текстуры — assets/<modid>/textures/...
+ • Эмиссив (светящиеся части): отдельная текстура *_glowing.png, подключается через GeoRenderLayer (AutoGlowingGeoLayer).
+
+Посохи (ключевые модели):
+ А. Посох Звёздопада Разрушителя — длина 2.5 блока, оранжевое ядро-лава в навершии, парящие осколки (3 шт.), анимация: вращение ядра (360° за 4 с), пульсация света.
+ Б. Посох Бездны — чёрный скелетоподобный посох с черепом, внутри глаза светятся фиолетовым; анимация: моргание глаз, дрожь.
+ В. Посох Хроноса — песочные часы-навершие, песок "течёт"; анимация: перелив песка, вращение стрелок.
+ Г. Посох Древа Жизни — живая ветвь, цветущая верхушка; анимация: покачивание, раскрытие цветка при касте.
+ Д. Посох Создателя Миров — золотой с радужными кольцами; три вращающихся кольца в разных осях; кристалл-ядро с анимацией дыхания.
+ Анимации для каждого: idle (loop), cast (0.5 с), ultimate (1.5 с, вспышка).
+
+Броня (3D):
+ • Нагрудник Хроно/Покрова Пустоты — крылья (wing_left/wing_right) по 4 сегмента перьев; анимации: idle (лёгкое колыхание), fly (взмах 1 с), land.
+ • Шлем Савана Бездны — изогнутые рога (horns) + светящиеся глаза в капюшоне.
+ • Шлем Эфирного Архимага — парящая над головой корона-кольцо с вращением.
+ • Требование: расчёт размеров под стандартный скин Steve/Alex; анимации через GeoArmorRenderer.
+
+Боссы (кастомные мобы):
+ 1. СТРАЖ АКАДЕМИИ ЭФИРА — каменный голем 4 блока высотой, 3 руки-кристалла. Анимации: idle, walk, slam (удар в землю), beam (луч), spawn, death.
+ 2. ХРАНИТЕЛЬ ЭФИРА — парящая фигура с рогами и 4 крылья. Фазы: огонь, бездна, время, природа — меняет цвет. Анимации: idle_float, attack_melee, attack_ranged, phase_change, death.
+ 3. ДРЕВНИЙ БОГ ЭФИРА — финальный босс, 12 блоков высотой, множество глаз/щупалец. Анимации: idle, tentacle_sweep, eye_beam, summon, enrage, death.
+ 4. Мини-босс: ЛИЧ КЛЕПСИДРЫ — для склепа некромантов.
+
+--- 5.2 JAVA: GeckoLib 4 — ПОСОХ С ВРАЩАЮЩИМСЯ КРИСТАЛЛОМ ---
+(GeckoLib 4.4.x для Forge 1.20.1.)
+
+// ===== item/CrystalStaffItem.java =====
+package com.aetherium.overlord.item;
+
+import com.aetherium.overlord.capability.MagicPath;
+import com.aetherium.overlord.client.renderer.CrystalStaffRenderer;
+import net.minecraft.client.renderer.BlockEntityWithoutLevelRenderer;
+import net.minecraftforge.client.extensions.common.IClientItemExtensions;
+import software.bernie.geckolib.animatable.GeoItem;
+import software.bernie.geckolib.animatable.SingletonGeoAnimatable;
+import software.bernie.geckolib.core.animatable.instance.AnimatableInstanceCache;
+import software.bernie.geckolib.core.animation.AnimatableManager;
+import software.bernie.geckolib.core.animation.AnimationController;
+import software.bernie.geckolib.core.animation.RawAnimation;
+import software.bernie.geckolib.core.object.PlayState;
+import software.bernie.geckolib.util.GeckoLibUtil;
+
+import java.util.function.Consumer;
+
+public class CrystalStaffItem extends ElementalStaff implements GeoItem {
+    private static final RawAnimation SPIN = RawAnimation.begin().thenLoop("animation.staff.spin");
+    private final AnimatableInstanceCache cache = GeckoLibUtil.createInstanceCache(this);
+
+    public CrystalStaffItem(Properties p, MagicPath path, int tier, float mana, int cd, float ultMana, int ultCd, float dmg) {
+        super(p, path, tier, mana, cd, ultMana, ultCd, dmg);
+        SingletonGeoAnimatable.registerSyncedAnimatable(this);
+    }
+
+    @Override
+    public void initializeClient(Consumer<IClientItemExtensions> consumer) {
+        consumer.accept(new IClientItemExtensions() {
+            private CrystalStaffRenderer renderer;
+            @Override
+            public BlockEntityWithoutLevelRenderer getCustomRenderer() {
+                if (this.renderer == null) this.renderer = new CrystalStaffRenderer();
+                return this.renderer;
+            }
+        });
+    }
+
+    @Override
+    public void registerControllers(AnimatableManager.ControllerRegistrar controllers) {
+        controllers.add(new AnimationController<>(this, "spin_controller", 0,
+                state -> state.setAndContinue(SPIN)));
+    }
+
+    @Override
+    public AnimatableInstanceCache getAnimatableInstanceCache() { return this.cache; }
+}
+
+// ===== client/renderer/CrystalStaffRenderer.java =====
+package com.aetherium.overlord.client.renderer;
+
+import com.aetherium.overlord.item.CrystalStaffItem;
+import software.bernie.geckolib.renderer.GeoItemRenderer;
+
+public class CrystalStaffRenderer extends GeoItemRenderer<CrystalStaffItem> {
+    public CrystalStaffRenderer() { super(new CrystalStaffModel()); }
+}
+
+// ===== client/renderer/CrystalStaffModel.java =====
+package com.aetherium.overlord.client.renderer;
+
+import com.aetherium.overlord.AetheriumOverlordMod;
+import com.aetherium.overlord.item.CrystalStaffItem;
+import net.minecraft.resources.ResourceLocation;
+import software.bernie.geckolib.model.GeoModel;
+
+public class CrystalStaffModel extends GeoModel<CrystalStaffItem> {
+    @Override public ResourceLocation getModelResource(CrystalStaffItem a) {
+        return new ResourceLocation(AetheriumOverlordMod.MODID, "geo/item/crystal_staff.geo.json");
+    }
+    @Override public ResourceLocation getTextureResource(CrystalStaffItem a) {
+        return new ResourceLocation(AetheriumOverlordMod.MODID, "textures/item/crystal_staff.png");
+    }
+    @Override public ResourceLocation getAnimationResource(CrystalStaffItem a) {
+        return new ResourceLocation(AetheriumOverlordMod.MODID, "animations/item/crystal_staff.animation.json");
+    }
+}
+
+Регистрация: new CrystalStaffItem(new Item.Properties().rarity(Rarity.EPIC), MagicPath.NONE, 6, 60, 80, 800, 12000, 20f)
+Нужна зависимость software.bernie.geckolib (подключена в build.gradle раздела 9, mods.toml — зависимость "geckolib").
+
+--- 5.3 JSON: ОТОБРАЖЕНИЕ ПРЕДМЕТА В РУКЕ (1-е и 3-е лицо) ---
+Файл: src/main/resources/assets/aetherium_overlord/models/item/crystal_staff.json
+{
+  "parent": "builtin/entity",
+  "gui_light": "front",
+  "display": {
+    "thirdperson_righthand": { "rotation": [0, -90, 55],  "translation": [0, 4.0, 0.5],  "scale": [1.0, 1.0, 1.0] },
+    "thirdperson_lefthand":  { "rotation": [0, 90, -55],  "translation": [0, 4.0, 0.5],  "scale": [1.0, 1.0, 1.0] },
+    "firstperson_righthand": { "rotation": [0, -90, 25],  "translation": [1.13, 3.2, 1.13], "scale": [0.68, 0.68, 0.68] },
+    "firstperson_lefthand":  { "rotation": [0, 90, -25],  "translation": [1.13, 3.2, 1.13], "scale": [0.68, 0.68, 0.68] },
+    "gui":    { "rotation": [30, 225, 0], "translation": [0, 0, 0], "scale": [0.6, 0.6, 0.6] },
+    "ground": { "rotation": [0, 0, 0],    "translation": [0, 3, 0],   "scale": [0.5, 0.5, 0.5] },
+    "fixed":  { "rotation": [0, 180, 0],  "translation": [0, 0, 0],   "scale": [1, 1, 1] }
+  }
+}
+
+Файл геометрии (GeckoLib): assets/aetherium_overlord/geo/item/crystal_staff.geo.json
+{
+  "format_version": "1.12.0",
+  "minecraft:geometry": [
+    {
+      "description": {
+        "identifier": "geometry.crystal_staff",
+        "texture_width": 64,
+        "texture_height": 64,
+        "visible_bounds_width": 3,
+        "visible_bounds_height": 4,
+        "visible_bounds_offset": [0, 1, 0]
+      },
+      "bones": [
+        { "name": "root", "pivot": [0, 0, 0] },
+        {
+          "name": "shaft", "parent": "root", "pivot": [0, 0, 0],
+          "cubes": [ { "origin": [-1, 0, -1], "size": [2, 24, 2], "uv": [0, 0] } ]
+        },
+        {
+          "name": "crystal", "parent": "root", "pivot": [0, 28, 0],
+          "cubes": [ { "origin": [-3, 25, -3], "size": [6, 6, 6], "uv": [8, 0], "rotation": [45, 0, 45], "pivot": [0, 28, 0] } ]
+        }
+      ]
+    }
+  ]
+}
+
+Файл анимации: assets/aetherium_overlord/animations/item/crystal_staff.animation.json
+{
+  "format_version": "1.8.0",
+  "animations": {
+    "animation.staff.spin": {
+      "loop": true,
+      "animation_length": 4.0,
+      "bones": {
+        "crystal": {
+          "rotation": {
+            "0.0": [0, 0, 0],
+            "4.0": [0, 360, 0]
+          },
+          "position": {
+            "0.0":  [0, 0, 0],
+            "1.0":  [0, 0.5, 0],
+            "2.0":  [0, 0, 0],
+            "3.0":  [0, 0.5, 0],
+            "4.0":  [0, 0, 0]
+          }
+        }
+      }
+    }
+  }
+}
+
+ВАЖНО: ИМЕНА В JSON (animation.staff.spin, кость "crystal") ДОЛЖНЫ совпадать с кодом.
+
+================================================================
+РАЗДЕЛ 6. СЮЖЕТНАЯ ВЕТКА И КВЕСТЫ (25 квестов)
+================================================================
+
+Лор: Эфир — первичная сила, из которой сотворён мир. Древний Бог Эфира (Эфирион, Overlord) был запечатан Магистрами Академии, но печати слабеют. Игрок — "Пробуждённый": последний, кто слышит шёпот маны.
+
+ №  Название                    Цель                                           Лорное описание                                      Награда
+ 1  Пробуждение маны            Добыть самоцвет маны (1 шт.)                   "Ты чувствуешь тепло в ладонях..."                  Фолиант Выбора Пути, 1 Осколок Пути, 100 XP
+ 2  Выбор Пути                  Выбрать Путь через фолиант                     "Стихия зовёт тебя."                                 2 Осколка Пути
+ 3  Эфирная руда                Добыть 8 эфирита                               "Жила эфира глубоко под камнем."                     Деревянный посох ученика
+ 4  Первый посох                Скрафтить посох своего Пути (T1)               "Посох — продолжение воли."                          1 Осколок Пути, 10 пустых рун
+ 5  Стол начертания             Создать Стол начертания рун                    "Знаки хранят силу."                                 Пустые руны x16, эссенция Пути
+ 6  Алтарь слияния              Построить Алтарь слияния                       "Алтарь сливает несоединимое."                       Эфирный слиток x4, Осколок Пути x2
+ 7  Первый обелиск              Построить Обелиск маны I                       "Мана течёт, как река."                              Кольцо Маны I
+ 8  Акробатика эфира            Достичь 3 уровня Пути                          "Ты растёшь вместе с силой."                         Амулет Пути (Curios)
+ 9  Летающая Академия           Найти Летающую Академию                        "Остров, парящий над облаками."                      Свиток телепортации x2, 3 Осколка Пути
+ 10 Склеп Забытых               Найти Склеп Некроманта                         "Здесь спят те, кто не смог уйти."                   Осколок Души x4, Гримуар Пути
+ 11 Закалка ученика             Скрафтить полный сет брони T1                  "Одежда мага — его вторая кожа."                     Кольцо Маны II
+ 12 Страж Академии (БОСС 1)     Победить Стража Академии Эфира                 "Голем не пропустит недостойных."                    Посох T3, 3 очка пути, Руна Универсала
+ 13 Незер-мана                  Добыть тлеющий уголь/осколки души             "Даже огонь здесь поёт."                             Эссенция Огня, Осколок Пути
+ 14 Разлом                      Войти в Обезображенный Разлом                  "Мир трещит, и из трещин сочится тьма."              Эндерит x2, 2 очка
+ 15 Реликвии Curios             Надеть 3 артефакта                             "Реликвии помнят владельцев."                        Пояс Мага
+ 16 Сердце леса                 Найти Рощу Друидов, получить Эссенцию Природы  "Живая сила, что древнее магии."                   Эссенция Природы, Осколок Пути
+ 17 Мастер стихий               Иметь 4 эссенции стихий                         "Четыре начала — одно целое."                        Посох Архимага (заготовка), 3 очка
+ 18 Рунный архимаг              Начертать 10 рун                                "Каждая руна — слово силы."                          Сет Архимага: шлем
+ 19 Врата Эфира                 Построить портал в Эфирное Измерение           "Дверь в мир мерцающего света."                      Свиток телепорта x4, 3 очка
+ 20 Эфирное Измерение           Войти в Эфирное Измерение                      "Здесь рождаются миры."                              Лунный серебряный комплект
+ 21 Хранитель Эфира (БОСС 2)    Победить Хранителя Эфира                       "Страж последнего порога."                           Кристалл Хроно x4, 5 очков, Реликвия Хранителя
+ 22 Покров Пустоты              Добыть эндерит и сделать Сет Пустоты           "Пустота принимает достойных."                       Сет Покров Пустоты (1 вещь на выбор)
+ 23 Оружие Повелителя           Создать Клинок Повелителя                      "Меч, который режет саму ткань мира."                Сплав Повелителя x8, 5 очков
+ 24 Создатель Миров             Скрафтить Посох Создателя Миров                "Сотворение доступно лишь тому, кто готов рискнуть." Реликвия Создателя, 5 очков
+ 25 Убийство Древнего Бога Эфира Победить Эфириона на Арене Бога              "Эфир замолкает. Теперь он — твой."                  Реликвия Древнего Бога, 10 очков, 1000 XP, титул
+
+--- Конфигурация FTB Quests (SNBT) ---
+Расположение: <папка игры>/config/ftbquests/quests/chapters/aetherium_overlord.snbt
+Формат — версии FTB Quests для 1.20.1 (2001.x). Ниже — готовая глава с квестами 1–6 и 25 (остальные добавляются по тому же образцу).
+ВАЖНО: ID должны быть уникальными 16-значными hex-строками.
+Если игра ругается на формат — откройте FTB Quests в игре, создайте пустую главу, закройте игру и сверьте структуру с автосгенерированным файлом: поля те же.
+
+{
+	id: "7A3E0F2B1C000001"
+	group: ""
+	order_index: 0
+	filename: "aetherium_overlord"
+	title: "Aetherium Overlord"
+	icon: "aetherium_overlord:mana_crystal"
+	default_quest_shape: ""
+	default_hide_dependency_lines: false
+	quests: [
+		{
+			title: "Пробуждение маны"
+			x: 0.0d
+			y: 0.0d
+			description: [
+				"Ты чувствуешь тепло в ладонях..."
+				"Найди самоцвет маны, чтобы пробудить дремлющую силу."
+			]
+			id: "7A3E0F2B1C000101"
+			tasks: [{
+				id: "7A3E0F2B1C000201"
+				type: "item"
+				item: "aetherium_overlord:mana_crystal"
+			}]
+			rewards: [
+				{
+					id: "7A3E0F2B1C000301"
+					type: "item"
+					item: "aetherium_overlord:path_tome"
+				}
+				{
+					id: "7A3E0F2B1C000302"
+					type: "xp"
+					xp: 100
+				}
+			]
+		}
+		{
+			title: "Выбор Пути"
+			x: 2.0d
+			y: 0.0d
+			description: ["Стихия зовёт тебя. Используй Фолиант Выбора Пути."]
+			dependencies: ["7A3E0F2B1C000101"]
+			id: "7A3E0F2B1C000102"
+			tasks: [{
+				id: "7A3E0F2B1C000202"
+				type: "checkmark"
+				title: "Я выбрал свой Путь"
+			}]
+			rewards: [{
+				id: "7A3E0F2B1C000303"
+				type: "item"
+				item: {
+					id: "aetherium_overlord:path_shard"
+					Count: 2
+				}
+			}]
+		}
+		{
+			title: "Эфирная руда"
+			x: 4.0d
+			y: 0.0d
+			description: ["Жила эфира лежит глубоко под камнем. Добудь 8 единиц."]
+			dependencies: ["7A3E0F2B1C000102"]
+			id: "7A3E0F2B1C000103"
+			tasks: [{
+				id: "7A3E0F2B1C000203"
+				type: "item"
+				item: {
+					id: "aetherium_overlord:raw_ether"
+					Count: 8
+				}
+			}]
+			rewards: [{
+				id: "7A3E0F2B1C000304"
+				type: "item"
+				item: "aetherium_overlord:apprentice_staff"
+			}]
+		}
+		{
+			title: "Первый посох"
+			x: 6.0d
+			y: 0.0d
+			description: ["Посох — продолжение воли мага."]
+			dependencies: ["7A3E0F2B1C000103"]
+			id: "7A3E0F2B1C000104"
+			tasks: [{
+				id: "7A3E0F2B1C000204"
+				type: "item"
+				item: "aetherium_overlord:ember_staff"
+			}]
+			rewards: [{
+				id: "7A3E0F2B1C000305"
+				type: "item"
+				item: {
+					id: "aetherium_overlord:path_shard"
+					Count: 1
+				}
+			}]
+		}
+		{
+			title: "Стол начертания"
+			x: 8.0d
+			y: 0.0d
+			description: ["Знаки хранят силу. Создай Стол начертания рун."]
+			dependencies: ["7A3E0F2B1C000104"]
+			id: "7A3E0F2B1C000105"
+			tasks: [{
+				id: "7A3E0F2B1C000205"
+				type: "item"
+				item: "aetherium_overlord:rune_inscription_table"
+			}]
+			rewards: [{
+				id: "7A3E0F2B1C000306"
+				type: "item"
+				item: {
+					id: "aetherium_overlord:blank_rune"
+					Count: 16
+				}
+			}]
+		}
+		{
+			title: "Алтарь слияния"
+			x: 10.0d
+			y: 0.0d
+			description: ["Алтарь сливает несоединимое."]
+			dependencies: ["7A3E0F2B1C000105"]
+			id: "7A3E0F2B1C000106"
+			tasks: [{
+				id: "7A3E0F2B1C000206"
+				type: "item"
+				item: "aetherium_overlord:fusion_altar"
+			}]
+			rewards: [{
+				id: "7A3E0F2B1C000307"
+				type: "item"
+				item: {
+					id: "aetherium_overlord:ether_ingot"
+					Count: 4
+				}
+			}]
+		}
+		{
+			title: "Убийство Древнего Бога Эфира"
+			subtitle: "Финал"
+			x: 12.0d
+			y: 0.0d
+			shape: "hexagon"
+			size: 1.5d
+			description: [
+				"Эфир замолкает. Теперь он — твой."
+				"Победи Эфириона на Арене Бога."
+			]
+			dependencies: ["7A3E0F2B1C000106"]
+			id: "7A3E0F2B1C000125"
+			tasks: [{
+				id: "7A3E0F2B1C000225"
+				type: "kill"
+				entity: "minecraft:wither"
+				value: 1L
+			}]
+			rewards: [
+				{
+					id: "7A3E0F2B1C000325"
+					type: "xp"
+					xp: 1000
+				}
+				{
+					id: "7A3E0F2B1C000326"
+					type: "item"
+					item: {
+						id: "aetherium_overlord:path_shard"
+						Count: 10
+					}
+				}
+			]
+		}
+	]
+}
+(В финальном квесте как заглушка стоит Иссушитель — замените entity на "aetherium_overlord:ancient_ether_god", когда добавите босса в мод.)
+
+================================================================
+РАЗДЕЛ 7. ГЕНЕРАЦИЯ МИРА И СТРУКТУРЫ (12 типов)
+================================================================
+
+--- 7.1 Биомы ---
+ 1. Эфирные Рощи (Верхний мир) — светящаяся трава, зачарованные деревья, мана-мох, лунные лилии. Мобы: эфирные олени (нейтр.), светлячки-духи. Редкий биом, рядом с ним чаще появляются руды эфира.
+ 2. Кристальная Пустошь (Верхний мир, горы) — кластеры кристаллов 4 цветов, выходы руды Самоцвета Маны. Мобы: кристальные големы (враждебные), каменные жуки.
+ 3. Выжженный Разлом (Незер) — трещины с эфирным светом, руда Тлеющего Угля. Мобы: пепельные элементали, обезображенные призраки.
+ 4. Эфирное Измерение — парящие острова, море света, Арена Бога в центре.
+
+--- 7.2 Структуры ---
+ 1. ЛЕТАЮЩАЯ АКАДЕМИЯ МАГОВ
+    Где: небо над Верхним миром, высота Y=150–220. Редкость: 1 на ~2000x2000 блоков.
+    Размер: главный остров 60x60, башни до 40 блоков, 3–5 малых островов.
+    Лут: сундуки библиотеки — свитки, пустые руны, самоцветы маны, гримуары T1–T2; в хранилище — посох T2–T3.
+    Мобы: призрачные ученики (стреляют искрой), магические стражи, мини-босс Страж Академии (Арена в центре, Квест №12).
+ 2. ПОДЗЕМНЫЙ СКЛЕП НЕКРОМАНТА
+    Где: под землёй Y=-50…10. Редкость: 1 на ~1500 блоков.
+    Размер: 40x40, 3 уровня, катакомбы.
+    Лут: осколки души, кости/мясо гнили, Гримуар Костяной Жатвы, посох некро T1–T3, редкий амулет Души.
+    Мобы: скелеты-маги, зомби-слуги, призрачные векса, мини-босс Лич Клепсидры.
+ 3. ОБЕЗОБРАЖЕННЫЙ РАЗЛОМ
+    Где: Верхний мир (поверхность, как трещина 80 блоков) и в Незере. Редкость: 1 на ~2500 блоков.
+    Особенности: гравитационные аномалии, обезображенные блоки (случайная замена текстуры), портал вниз в мини-измерение.
+    Лут: эндерит, кровавая ржавь, рунные обломки, артефакты T2.
+    Мобы: обезображенные (искажённые версии зомби/скелетов), тени, Страж Разлома.
+ 4. АРЕНА СТРАЖА ЭФИРА (Босс 1)
+    Где: центр Летающей Академии, закрытая арена 30x30 (активируется Алтарём призыва).
+    Бой: 3 фазы — удар кулаками, лучи кристаллов, призыв каменных големов.
+    Лут: посох T3, Руна Универсала, 3 очка пути, шанс Гримуара Архимага.
+ 5. БАШНЯ ХРОНОМАНТА
+    Где: равнины/пустыня; башня 12x12 высотой 50, внутри — часовой механизм.
+    Лут: хронокристаллы, песочные посохи, кольцо Песка Времени.
+    Мобы: часовые автоматоны (замедляют), хрономаг-призрак.
+ 6. РОЩА ДРУИДОВ (Древо Жизни)
+    Где: биом Эфирные Рощи/тёмный лес. Гигантское древо (40 блоков) и круг камней.
+    Лут: эссенция природы, посохи друида T1–T3, плащ Хранителя.
+    Мобы: энты-стражи (нейтральные, агрессивны при порче рощи), дриады.
+ 7. ВУЛКАНИЧЕСКИЙ АЛТАРЬ ПИРОМАНТОВ
+    Где: Незер, около лавовых озёр. Платформа с лавовым фонтаном.
+    Лут: эссенция огня, посох пиро T2–T4, сеты Пепельного Пиромантa (части).
+    Мобы: огненные элементали, магма-големы, Огненный Страж (мини-босс).
+ 8. ЭНДСКАЯ ЦИТАДЕЛЬ ЭФИРА
+    Где: внешние острова Энда. Фиолетово-золотая башня 70 блоков.
+    Лут: эндерит, эфирный сплав, части Покрова Пустоты, реликвии.
+    Мобы: стражи пустоты, эндер-маги, босс Хранитель Эфира (Босс 2, Квест №21).
+ 9. ЗАТОПЛЕННАЯ БИБЛИОТЕКА
+    Где: океаны, дно. Стеклянный купол, магическое стекло.
+    Лут: свитки телепорта, пустые руны, гримуары.
+    Мобы: утопшие маги, стражи вод.
+ 10. РУННЫЙ ОБЕЛИСК (малая структура)
+    Где: любой биом, высота 8–15 блоков, много штук.
+    Лут: самоцветы маны, руны. Особенность: подзаряжает ману рядом (аура).
+ 11. ЛАГЕРЬ ОТСТУПНИКОВ
+    Где: поверхность, 20x20. Лут: гримуары, зелья.
+    Мобы: отступники-маги (человеко-образные), атакуют с посохами.
+ 12. АРЕНА БОГА (Босс 3, финал)
+    Где: центр Эфирного Измерения. Круглая арена 60 блоков с руническими кругами.
+    Бой: Древний Бог Эфира — 4 фазы (по стихиям), 1200 HP, призыв, лучи, ярость.
+    Лут: Реликвия Древнего Бога, 10 очков пути, 1000 XP, сплав Повелителя.
+
+--- 7.3 Техническая реализация ---
+Структуры в 1.20.1 — только данные (датапак): шаблоны NBT + JSON.
+ • data/aetherium_overlord/structures/<имя>.nbt        — файлы из блока структуры (сохраняете в игре)
+ • data/aetherium_overlord/worldgen/template_pool/*.json
+ • data/aetherium_overlord/worldgen/structure/*.json
+ • data/aetherium_overlord/worldgen/structure_set/*.json (spacing, separation, salt)
+ • data/aetherium_overlord/forge/biome_modifier/*.json   — добавить руды/структуры в существующие биомы
+
+Пример: руда в Верхнем мире (configured + placed feature + biome modifier):
+
+// data/aetherium_overlord/worldgen/configured_feature/ether_ore.json
+{
+  "type": "minecraft:ore",
+  "config": {
+    "discard_chance_on_air_exposure": 0.0,
+    "size": 6,
+    "targets": [
+      { "state": { "Name": "aetherium_overlord:ether_ore" },
+        "target": { "predicate_type": "minecraft:tag_match", "tag": "minecraft:stone_ore_replaceables" } },
+      { "state": { "Name": "aetherium_overlord:deepslate_ether_ore" },
+        "target": { "predicate_type": "minecraft:tag_match", "tag": "minecraft:deepslate_ore_replaceables" } }
+    ]
+  }
+}
+
+// data/aetherium_overlord/worldgen/placed_feature/ether_ore.json
+{
+  "feature": "aetherium_overlord:ether_ore",
+  "placement": [
+    { "type": "minecraft:count", "count": 6 },
+    { "type": "minecraft:in_square" },
+    { "type": "minecraft:height_range", "height": { "type": "minecraft:trapezoid", "min_inclusive": { "absolute": -64 }, "max_inclusive": { "absolute": 32 } } },
+    { "type": "minecraft:biome" }
+  ]
+}
+
+// data/aetherium_overlord/forge/biome_modifier/add_ether_ore.json
+{
+  "type": "forge:add_features",
+  "biomes": "#minecraft:is_overworld",
+  "features": "aetherium_overlord:ether_ore",
+  "step": "underground_ores"
+}
+
+Лут-таблица руды (самоцвет маны): data/aetherium_overlord/loot_tables/blocks/mana_ore.json
+{
+  "type": "minecraft:block",
+  "pools": [{
+    "rolls": 1,
+    "entries": [{
+      "type": "minecraft:alternatives",
+      "children": [
+        { "type": "minecraft:item", "name": "aetherium_overlord:mana_ore",
+          "conditions": [{ "condition": "minecraft:match_tool", "predicate": { "enchantments": [{ "enchantment": "minecraft:silk_touch", "levels": { "min": 1 } }] } }] },
+        { "type": "minecraft:item", "name": "aetherium_overlord:mana_crystal",
+          "functions": [{ "function": "minecraft:apply_bonus", "enchantment": "minecraft:fortune", "formula": "minecraft:ore_drops" }] }
+      ]
+    }]
+  }]
+}
+
+Также нужен тег: data/minecraft/tags/blocks/mineable/pickaxe.json со всеми рудами и needs_iron_tool/needs_diamond_tool.
+
+================================================================
+РАЗДЕЛ 8. КРАФТЫ И ШАБЛОН КОДА РЕГИСТРАЦИИ
+================================================================
+
+--- 8.1 Многоступенчатый крафт: ПОСОХ СОЗДАТЕЛЯ МИРОВ ---
+Крафт делится на 6 этапов. Первые этапы — обычные рецепты, этапы 4–6 — Алтарь слияния
+(реализуется как собственный тип рецепта или как набор shaped-рецептов на более простом варианте).
+
+Этап 1. Эфирное Ядро (верстак):
+   4 Эфирных слитка + 4 Самоцвета маны + 1 Звезда Незера → Эфирное Ядро.
+Этап 2. Рунный каркас (Стол начертания рун):
+   Эфирный слиток x4 + Руна Огня + Руна Смерти + Руна Времени + Руна Жизни → Рунный Каркас Эфира.
+Этап 3. Сплав Повелителя (плавильня/Алтарь слияния):
+   Эндерит x4 + Лунное серебро x4 + Хроно-кристалл x2 + Блок эфира → 2 Сплава Повелителя.
+Этап 4. Сердце Посоха (Алтарь слияния + 4 пьедестала):
+   Эфирное Ядро + Эссенция Огня + Эссенция Бездны + Эссенция Времени + Эссенция Природы → Сердце Стихий.
+   (Эссенции: Огня — Огненный Страж, Бездны — Лич Клепсидры, Времени — Башня Хрономанта, Природы — Роща Друидов.)
+Этап 5. Зарядка (Зарядный пьедестал):
+   Сердце Стихий нужно зарядить 10 000 единицами маны (5–10 минут рядом с обелиском III уровня).
+Этап 6. Финальное слияние (Алтарь слияния + 8 пьедесталов):
+   Посох Падшего Бога Эфира + Рунный Каркас Эфира + Сердце Стихий (заряженное) + 2 Сплава Повелителя
+   + Реликвия Хранителя Эфира + Осколок Пути x5 → ПОСОХ СОЗДАТЕЛЯ МИРОВ.
+
+Пример JSON рецепта (shaped) — Эфирное Ядро:
+// data/aetherium_overlord/recipes/ether_core.json
+{
+  "type": "minecraft:crafting_shaped",
+  "pattern": ["IGI", "GNG", "IGI"],
+  "key": {
+    "I": { "item": "aetherium_overlord:ether_ingot" },
+    "G": { "item": "aetherium_overlord:mana_crystal" },
+    "N": { "item": "minecraft:nether_star" }
+  },
+  "result": { "item": "aetherium_overlord:ether_core" }
+}
+(ether_core — предмет, добавьте регистрацию по образцу ModItems ниже.)
+
+--- 8.2 Java-КОД РЕГИСТРАЦИИ ---
+
+// ===== AetheriumOverlordMod.java =====
+package com.aetherium.overlord;
+
+import com.aetherium.overlord.network.ModNetwork;
+import com.aetherium.overlord.registry.ModBlocks;
+import com.aetherium.overlord.registry.ModCreativeTabs;
+import com.aetherium.overlord.registry.ModEntities;
+import com.aetherium.overlord.registry.ModItems;
+import net.minecraftforge.common.MinecraftForge;
+import net.minecraftforge.eventbus.api.IEventBus;
+import net.minecraftforge.fml.common.Mod;
+import net.minecraftforge.fml.event.lifecycle.FMLCommonSetupEvent;
+import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
+import org.slf4j.Logger;
+import com.mojang.logging.LogUtils;
+
+@Mod(AetheriumOverlordMod.MODID)
+public class AetheriumOverlordMod {
+    public static final String MODID = "aetherium_overlord";
+    public static final Logger LOGGER = LogUtils.getLogger();
+
+    public AetheriumOverlordMod() {
+        IEventBus modBus = FMLJavaModLoadingContext.get().getModEventBus();
+
+        ModItems.ITEMS.register(modBus);
+        ModBlocks.BLOCKS.register(modBus);
+        ModEntities.ENTITIES.register(modBus);
+        ModCreativeTabs.TABS.register(modBus);
+
+        modBus.addListener(this::commonSetup);
+        MinecraftForge.EVENT_BUS.register(this);
+    }
+
+    private void commonSetup(final FMLCommonSetupEvent event) {
+        event.enqueueWork(ModNetwork::register);
+        LOGGER.info("Aetherium Overlord: инициализация завершена");
+    }
+}
+
+// ===== registry/ModArmorMaterial.java =====
+package com.aetherium.overlord.registry;
+
+import net.minecraft.sounds.SoundEvent;
+import net.minecraft.sounds.SoundEvents;
+import net.minecraft.world.item.ArmorItem;
+import net.minecraft.world.item.ArmorMaterial;
+import net.minecraft.world.item.crafting.Ingredient;
+
+public enum ModArmorMaterial implements ArmorMaterial {
+    ARCHMAGE("aetherium_overlord:archmage", 38, new int[]{3, 6, 8, 3}, 30, 3.0f, 0.1f);
+
+    private static final int[] BASE_DURABILITY = {13, 15, 16, 11};
+    private final String name;
+    private final int durabilityMultiplier;
+    private final int[] protection;
+    private final int enchantability;
+    private final float toughness, knockback;
+
+    ModArmorMaterial(String name, int mult, int[] prot, int ench, float tough, float kb) {
+        this.name = name; this.durabilityMultiplier = mult; this.protection = prot;
+        this.enchantability = ench; this.toughness = tough; this.knockback = kb;
+    }
+
+    @Override public int getDurabilityForType(ArmorItem.Type type) { return BASE_DURABILITY[type.ordinal()] * durabilityMultiplier; }
+    @Override public int getDefenseForType(ArmorItem.Type type) { return protection[type.ordinal()]; }
+    @Override public int getEnchantmentValue() { return enchantability; }
+    @Override public SoundEvent getEquipSound() { return SoundEvents.ARMOR_EQUIP_DIAMOND; }
+    @Override public Ingredient getRepairIngredient() { return Ingredient.of(ModItems.ETHER_INGOT.get()); }
+    @Override public String getName() { return name; }
+    @Override public float getToughness() { return toughness; }
+    @Override public float getKnockbackResistance() { return knockback; }
+}
+// Примечание: порядок ArmorItem.Type в 1.20.1: HELMET, CHESTPLATE, LEGGINGS, BOOTS (массивы выше в этом порядке).
+// getName() должен совпадать с путём текстур: assets/aetherium_overlord/textures/models/armor/archmage_layer_1.png и _layer_2.png.
+// Так как name содержит "modid:name", Forge подставит namespace автоматически.
+
+// ===== item/PathShardItem.java =====
+package com.aetherium.overlord.item;
+
+import com.aetherium.overlord.capability.ModCapabilities;
+import com.aetherium.overlord.network.ModNetwork;
+import net.minecraft.network.chat.Component;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.InteractionResultHolder;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.Level;
+
+public class PathShardItem extends Item {
+    public PathShardItem(Properties p) { super(p); }
+
+    @Override
+    public InteractionResultHolder<ItemStack> use(Level level, Player player, InteractionHand hand) {
+        ItemStack stack = player.getItemInHand(hand);
+        if (!level.isClientSide && player instanceof ServerPlayer sp) {
+            sp.getCapability(ModCapabilities.PLAYER_MANA).ifPresent(m -> {
+                if (!m.isPathChosen()) {
+                    sp.displayClientMessage(Component.literal("§cСначала выбери Путь (фолиант)"), true);
+                    return;
+                }
+                m.addPathPoints(1);
+                m.levelUp();            // автоповышение, если хватает очков
+                m.forceSync();
+                stack.shrink(1);
+                ModNetwork.syncMana(sp);
+            });
+        }
+        return InteractionResultHolder.sidedSuccess(stack, level.isClientSide);
+    }
+}
+
+// ===== registry/ModItems.java =====
+package com.aetherium.overlord.registry;
+
+import com.aetherium.overlord.AetheriumOverlordMod;
+import com.aetherium.overlord.capability.MagicPath;
+import com.aetherium.overlord.item.*;
+import net.minecraft.world.item.ArmorItem;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.Rarity;
+import net.minecraft.world.item.SwordItem;
+import net.minecraft.world.item.Tiers;
+import net.minecraftforge.registries.DeferredRegister;
+import net.minecraftforge.registries.ForgeRegistries;
+import net.minecraftforge.registries.RegistryObject;
+
+public class ModItems {
+    public static final DeferredRegister<Item> ITEMS =
+            DeferredRegister.create(ForgeRegistries.ITEMS, AetheriumOverlordMod.MODID);
+
+    // --- ресурсы и ключевые предметы ---
+    public static final RegistryObject<Item> PATH_TOME = ITEMS.register("path_tome",
+            () -> new PathTomeItem(new Item.Properties().rarity(Rarity.EPIC)));
+    public static final RegistryObject<Item> PATH_SHARD = ITEMS.register("path_shard",
+            () -> new PathShardItem(new Item.Properties().rarity(Rarity.RARE)));
+    public static final RegistryObject<Item> MANA_CRYSTAL = ITEMS.register("mana_crystal",
+            () -> new Item(new Item.Properties()));
+    public static final RegistryObject<Item> RAW_ETHER = ITEMS.register("raw_ether",
+            () -> new Item(new Item.Properties()));
+    public static final RegistryObject<Item> ETHER_INGOT = ITEMS.register("ether_ingot",
+            () -> new Item(new Item.Properties()));
+    public static final RegistryObject<Item> BLANK_RUNE = ITEMS.register("blank_rune",
+            () -> new Item(new Item.Properties()));
+    public static final RegistryObject<Item> ETHER_CORE = ITEMS.register("ether_core",
+            () -> new Item(new Item.Properties().rarity(Rarity.RARE)));
+
+    // --- посохи (стак 1 обеспечивает durability) ---
+    public static final RegistryObject<Item> APPRENTICE_STAFF = ITEMS.register("apprentice_staff",
+            () -> new ElementalStaff(new Item.Properties().durability(250),
+                    MagicPath.NONE, 1, 5, 20, 40, 400, 3f));
+    public static final RegistryObject<Item> EMBER_STAFF = ITEMS.register("ember_staff",
+            () -> new ElementalStaff(new Item.Properties().durability(400),
+                    MagicPath.PYROMANCER, 1, 10, 30, 60, 500, 5f));
+    public static final RegistryObject<Item> SOUL_STAFF = ITEMS.register("soul_staff",
+            () -> new ElementalStaff(new Item.Properties().durability(400),
+                    MagicPath.NECROMANCER, 1, 10, 30, 60, 500, 5f));
+    public static final RegistryObject<Item> HOURGLASS_STAFF = ITEMS.register("hourglass_staff",
+            () -> new ElementalStaff(new Item.Properties().durability(400),
+                    MagicPath.CHRONOMANCER, 1, 10, 20, 60, 400, 4f));
+    public static final RegistryObject<Item> GROVE_STAFF = ITEMS.register("grove_staff",
+            () -> new ElementalStaff(new Item.Properties().durability(400),
+                    MagicPath.DRUID, 1, 10, 30, 60, 500, 4f));
+    public static final RegistryObject<Item> WORLD_CREATOR_STAFF = ITEMS.register("world_creator_staff",
+            () -> new CrystalStaffItem(new Item.Properties().durability(5000).rarity(Rarity.EPIC),
+                    MagicPath.NONE, 6, 60, 80, 800, 12000, 20f));
+
+    // --- оружие ---
+    public static final RegistryObject<Item> ETHER_SWORD = ITEMS.register("ether_sword",
+            () -> new SwordItem(Tiers.NETHERITE, 4, -2.4f, new Item.Properties().rarity(Rarity.RARE)));
+
+    // --- броня Эфирного Архимага ---
+    public static final RegistryObject<Item> ARCHMAGE_HELMET = ITEMS.register("archmage_helmet",
+            () -> new ArmorItem(ModArmorMaterial.ARCHMAGE, ArmorItem.Type.HELMET, new Item.Properties()));
+    public static final RegistryObject<Item> ARCHMAGE_CHESTPLATE = ITEMS.register("archmage_chestplate",
+            () -> new ArmorItem(ModArmorMaterial.ARCHMAGE, ArmorItem.Type.CHESTPLATE, new Item.Properties()));
+    public static final RegistryObject<Item> ARCHMAGE_LEGGINGS = ITEMS.register("archmage_leggings",
+            () -> new ArmorItem(ModArmorMaterial.ARCHMAGE, ArmorItem.Type.LEGGINGS, new Item.Properties()));
+    public static final RegistryObject<Item> ARCHMAGE_BOOTS = ITEMS.register("archmage_boots",
+            () -> new ArmorItem(ModArmorMaterial.ARCHMAGE, ArmorItem.Type.BOOTS, new Item.Properties()));
+}
+// Итого предметов в ModItems: 18. Вместе с блоками из ModBlocks (11) — 29 зарегистрированных позиций.
+
+// ===== registry/ModBlocks.java =====
+package com.aetherium.overlord.registry;
+
+import com.aetherium.overlord.AetheriumOverlordMod;
+import net.minecraft.world.item.BlockItem;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.Rarity;
+import net.minecraft.util.valueproviders.UniformInt;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.DropExperienceBlock;
+import net.minecraft.world.level.block.GlassBlock;
+import net.minecraft.world.level.block.SoundType;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+import net.minecraft.world.level.material.MapColor;
+import net.minecraftforge.registries.DeferredRegister;
+import net.minecraftforge.registries.ForgeRegistries;
+import net.minecraftforge.registries.RegistryObject;
+
+import java.util.function.Supplier;
+
+public class ModBlocks {
+    public static final DeferredRegister<Block> BLOCKS =
+            DeferredRegister.create(ForgeRegistries.BLOCKS, AetheriumOverlordMod.MODID);
+
+    // --- руды ---
+    public static final RegistryObject<Block> ETHER_ORE = registerBlock("ether_ore",
+            () -> new DropExperienceBlock(BlockBehaviour.Properties.of().mapColor(MapColor.STONE)
+                    .strength(3f, 3f).requiresCorrectToolForDrops().sound(SoundType.STONE),
+                    UniformInt.of(2, 5)));
+    public static final RegistryObject<Block> DEEPSLATE_ETHER_ORE = registerBlock("deepslate_ether_ore",
+            () -> new DropExperienceBlock(BlockBehaviour.Properties.of().mapColor(MapColor.DEEPSLATE)
+                    .strength(4.5f, 3f).requiresCorrectToolForDrops().sound(SoundType.DEEPSLATE),
+                    UniformInt.of(2, 5)));
+    public static final RegistryObject<Block> MANA_ORE = registerBlock("mana_ore",
+            () -> new DropExperienceBlock(BlockBehaviour.Properties.of().mapColor(MapColor.STONE)
+                    .strength(3f, 3f).requiresCorrectToolForDrops().sound(SoundType.STONE).lightLevel(s -> 5),
+                    UniformInt.of(3, 7)));
+    public static final RegistryObject<Block> ETHER_BLOCK = registerBlock("ether_block",
+            () -> new Block(BlockBehaviour.Properties.of().mapColor(MapColor.COLOR_CYAN)
+                    .strength(5f, 6f).requiresCorrectToolForDrops().sound(SoundType.METAL)));
+
+    // --- декор ---
+    public static final RegistryObject<Block> RUNE_BRICKS = registerBlock("rune_bricks",
+            () -> new Block(BlockBehaviour.Properties.of().mapColor(MapColor.COLOR_PURPLE)
+                    .strength(2f, 6f).requiresCorrectToolForDrops().sound(SoundType.STONE)));
+    public static final RegistryObject<Block> ENCHANTED_PLANKS = registerBlock("enchanted_planks",
+            () -> new Block(BlockBehaviour.Properties.of().mapColor(MapColor.COLOR_LIGHT_BLUE)
+                    .strength(2f, 3f).sound(SoundType.WOOD)));
+    public static final RegistryObject<Block> GLOWING_CRYSTAL = registerBlock("glowing_crystal",
+            () -> new Block(BlockBehaviour.Properties.of().mapColor(MapColor.COLOR_LIGHT_BLUE)
+                    .strength(1.5f).sound(SoundType.AMETHYST).lightLevel(s -> 12)));
+    public static final RegistryObject<Block> MAGIC_GLASS = registerBlock("magic_glass",
+            () -> new GlassBlock(BlockBehaviour.Properties.of().strength(0.4f).sound(SoundType.GLASS)
+                    .noOcclusion().lightLevel(s -> 4)));
+
+    // --- механизмы (пока обычные блоки; логику добавьте через BlockEntity) ---
+    public static final RegistryObject<Block> RUNE_INSCRIPTION_TABLE = registerBlock("rune_inscription_table",
+            () -> new Block(BlockBehaviour.Properties.of().mapColor(MapColor.COLOR_PURPLE)
+                    .strength(3.5f).sound(SoundType.WOOD).noOcclusion()));
+    public static final RegistryObject<Block> FUSION_ALTAR = registerBlock("fusion_altar",
+            () -> new Block(BlockBehaviour.Properties.of().mapColor(MapColor.COLOR_BLACK)
+                    .strength(5f, 1200f).requiresCorrectToolForDrops().sound(SoundType.STONE)
+                    .lightLevel(s -> 8).noOcclusion()));
+    public static final RegistryObject<Block> MANA_OBELISK = registerBlock("mana_obelisk",
+            () -> new Block(BlockBehaviour.Properties.of().mapColor(MapColor.COLOR_CYAN)
+                    .strength(5f, 1200f).requiresCorrectToolForDrops().sound(SoundType.AMETHYST)
+                    .lightLevel(s -> 10).noOcclusion()));
+
+    private static <T extends Block> RegistryObject<T> registerBlock(String name, Supplier<T> block) {
+        RegistryObject<T> obj = BLOCKS.register(name, block);
+        ModItems.ITEMS.register(name, () -> new BlockItem(obj.get(), new Item.Properties()));
+        return obj;
+    }
+}
+
+// ===== registry/ModCreativeTabs.java =====
+package com.aetherium.overlord.registry;
+
+import com.aetherium.overlord.AetheriumOverlordMod;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.network.chat.Component;
+import net.minecraft.world.item.CreativeModeTab;
+import net.minecraft.world.item.ItemStack;
+import net.minecraftforge.registries.DeferredRegister;
+import net.minecraftforge.registries.RegistryObject;
+
+public class ModCreativeTabs {
+    public static final DeferredRegister<CreativeModeTab> TABS =
+            DeferredRegister.create(Registries.CREATIVE_MODE_TAB, AetheriumOverlordMod.MODID);
+
+    public static final RegistryObject<CreativeModeTab> MAIN = TABS.register("main",
+            () -> CreativeModeTab.builder()
+                    .title(Component.translatable("itemGroup.aetherium_overlord"))
+                    .icon(() -> new ItemStack(ModItems.WORLD_CREATOR_STAFF.get()))
+                    .displayItems((params, out) ->
+                            ModItems.ITEMS.getEntries().forEach(e -> out.accept(e.get())))
+                    .build());
+}
+
+// Языковой файл: assets/aetherium_overlord/lang/en_us.json (и ru_ru.json)
+{
+  "itemGroup.aetherium_overlord": "Aetherium Overlord",
+  "item.aetherium_overlord.path_tome": "Tome of the Path",
+  "item.aetherium_overlord.path_shard": "Path Shard",
+  "item.aetherium_overlord.mana_crystal": "Mana Crystal",
+  "item.aetherium_overlord.apprentice_staff": "Apprentice's Wooden Staff",
+  "item.aetherium_overlord.world_creator_staff": "Staff of the World Creator",
+  "block.aetherium_overlord.ether_ore": "Ether Ore"
+}
+// (для каждого предмета/блока добавляются ключи item.<modid>.<id> / block.<modid>.<id>)
+
+// Текстуры/модели: для каждого предмета нужен assets/aetherium_overlord/models/item/<id>.json, например:
+// { "parent": "minecraft:item/generated", "textures": { "layer0": "aetherium_overlord:item/mana_crystal" } }
+// (для посохов — "minecraft:item/handheld"), для блоков — blockstates/<id>.json + models/block/<id>.json.
+// Без текстур игра запустится, но покажет фиолетово-чёрную "заглушку" — это нормально для первой сборки.
+
+================================================================
+РАЗДЕЛ 9. СБОРКА ЧЕРЕЗ GITHUB ACTIONS
+================================================================
+
+--- 9.1 Дерево папок проекта (то, что загружается в репозиторий) ---
+
+aetherium-overlord/
+├── .github/
+│   └── workflows/
+│       └── build.yml
+├── gradle/
+│   └── wrapper/
+│       ├── gradle-wrapper.jar          (из Forge MDK 1.20.1; если нет — workflow создаст wrapper сам)
+│       └── gradle-wrapper.properties
+├── src/
+│   └── main/
+│       ├── java/com/aetherium/overlord/
+│       │   ├── AetheriumOverlordMod.java
+│       │   ├── capability/   (MagicPath, PlayerMana, ModCapabilities, PlayerManaProvider)
+│       │   ├── network/      (ModNetwork, ManaSyncPacket, ChoosePathPacket)
+│       │   ├── events/       (ManaEvents, ModBusEvents, ArmorBonuses)
+│       │   ├── entity/       (MagicBoltProjectile)
+│       │   ├── item/         (MagicStaffItem, ElementalStaff, CrystalStaffItem, PathTomeItem, PathShardItem)
+│       │   ├── registry/     (ModItems, ModBlocks, ModEntities, ModCreativeTabs, ModArmorMaterial)
+│       │   └── client/       (ClientManaData, ManaHud, ClientHooks, PathSelectScreen, ClientModEvents,
+│       │                      renderer/CrystalStaffRenderer, renderer/CrystalStaffModel)
+│       └── resources/
+│           ├── META-INF/mods.toml
+│           ├── pack.mcmeta
+│           ├── assets/aetherium_overlord/
+│           │   ├── lang/en_us.json
+│           │   ├── models/item/*.json
+│           │   ├── geo/item/crystal_staff.geo.json
+│           │   ├── animations/item/crystal_staff.animation.json
+│           │   └── textures/item/*.png
+│           └── data/aetherium_overlord/
+│               ├── recipes/*.json
+│               ├── loot_tables/blocks/*.json
+│               └── worldgen/…
+├── .gitignore
+├── build.gradle
+├── gradle.properties
+├── gradlew                              (из Forge MDK; необязательно, см. выше)
+├── gradlew.bat
+└── settings.gradle
+
+--- 9.2 settings.gradle ---
+pluginManagement {
+    repositories {
+        gradlePluginPortal()
+        maven {
+            name = 'MinecraftForge'
+            url = 'https://maven.minecraftforge.net/'
+        }
+    }
+}
+
+rootProject.name = 'aetherium-overlord'
+
+--- 9.3 gradle.properties ---
+org.gradle.jvmargs=-Xmx3G
+org.gradle.daemon=false
+org.gradle.caching=false
+
+minecraft_version=1.20.1
+minecraft_version_range=[1.20.1,1.21)
+forge_version=47.3.0
+forge_version_range=[47,)
+loader_version_range=[47,)
+mapping_channel=official
+mapping_version=1.20.1
+
+mod_id=aetherium_overlord
+mod_name=Aetherium Overlord
+mod_license=All Rights Reserved
+mod_version=1.0.0
+mod_group_id=com.aetherium.overlord
+mod_authors=YourName
+mod_description=Epic RPG magic mod: mana, 4 magic paths, 25 staves, bosses and quests.
+
+geckolib_version=4.4.9
+curios_version=5.4.0+1.20.1
+
+--- 9.4 build.gradle ---
+plugins {
+    id 'eclipse'
+    id 'idea'
+    id 'maven-publish'
+    id 'net.minecraftforge.gradle' version '[6.0,6.2)'
+}
+
+version = mod_version
+group = mod_group_id
+
+base {
+    archivesName = mod_id
+}
+
+java.toolchain.languageVersion = JavaLanguageVersion.of(17)
+
+minecraft {
+    mappings channel: mapping_channel, version: mapping_version
+    copyIdeResources = true
+
+    runs {
+        configureEach {
+            workingDirectory project.file('run')
+            property 'forge.logging.markers', 'REGISTRIES'
+            property 'forge.logging.console.level', 'debug'
+            mods {
+                "${mod_id}" {
+                    source sourceSets.main
+                }
+            }
+        }
+
+        client {
+            property 'forge.enabledGameTestNamespaces', mod_id
+        }
+
+        server {
+            property 'forge.enabledGameTestNamespaces', mod_id
+            args '--nogui'
+        }
+
+        data {
+            workingDirectory project.file('run-data')
+            args '--mod', mod_id, '--all', '--output', file('src/generated/resources/'), '--existing', file('src/main/resources/')
+        }
+    }
+}
+
+sourceSets.main.resources { srcDir 'src/generated/resources' }
+
+repositories {
+    // GeckoLib
+    maven {
+        name = 'GeckoLib'
+        url = 'https://dl.cloudsmith.io/public/geckolib3/geckolib/maven/'
+        content {
+            includeGroup 'software.bernie.geckolib'
+        }
+    }
+    // Curios API
+    maven {
+        name = 'Illusive Soulworks maven'
+        url = 'https://maven.theillusivec4.top/'
+        content {
+            includeGroup 'top.theillusivec4.curios'
+        }
+    }
+}
+
+dependencies {
+    minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
+
+    // GeckoLib 4 (нужна и при компиляции, и при запуске)
+    implementation fg.deobf("software.bernie.geckolib:geckolib-forge-${minecraft_version}:${geckolib_version}")
+
+    // Curios API: компилируем против API, в рантайме — полный мод
+    compileOnly fg.deobf("top.theillusivec4.curios:curios-forge:${curios_version}:api")
+    runtimeOnly fg.deobf("top.theillusivec4.curios:curios-forge:${curios_version}")
+}
+
+tasks.named('processResources', ProcessResources).configure {
+    var replaceProperties = [
+            minecraft_version      : minecraft_version,
+            minecraft_version_range: minecraft_version_range,
+            forge_version          : forge_version,
+            forge_version_range    : forge_version_range,
+            loader_version_range   : loader_version_range,
+            mod_id                 : mod_id,
+            mod_name               : mod_name,
+            mod_license            : mod_license,
+            mod_version            : mod_version,
+            mod_authors            : mod_authors,
+            mod_description        : mod_description,
+            geckolib_version       : geckolib_version
+    ]
+    inputs.properties replaceProperties
+
+    filesMatching(['META-INF/mods.toml', 'pack.mcmeta']) {
+        expand replaceProperties + [project: project]
+    }
+}
+
+tasks.named('jar', Jar).configure {
+    manifest {
+        attributes([
+                'Specification-Title'     : mod_id,
+                'Specification-Vendor'    : mod_authors,
+                'Specification-Version'   : '1',
+                'Implementation-Title'    : project.name,
+                'Implementation-Version'  : project.jar.archiveVersion,
+                'Implementation-Vendor'   : mod_authors
+        ])
+    }
+    finalizedBy 'reobfJar'
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
+publishing {
+    publications {
+        register('mavenJava', MavenPublication) {
+            artifact jar
+        }
+    }
+    repositories {
+        maven {
+            url "file://${project.projectDir}/mcmodsrepo"
+        }
+    }
+}
+
+--- 9.5 src/main/resources/META-INF/mods.toml ---
+modLoader="javafml"
+loaderVersion="${loader_version_range}"
+license="${mod_license}"
+
+[[mods]]
+modId="${mod_id}"
+version="${mod_version}"
+displayName="${mod_name}"
+authors="${mod_authors}"
+description='''${mod_description}'''
+
+[[dependencies.${mod_id}]]
+    modId="forge"
+    mandatory=true
+    versionRange="${forge_version_range}"
+    ordering="NONE"
+    side="BOTH"
+
+[[dependencies.${mod_id}]]
+    modId="minecraft"
+    mandatory=true
+    versionRange="${minecraft_version_range}"
+    ordering="NONE"
+    side="BOTH"
+
+[[dependencies.${mod_id}]]
+    modId="geckolib"
+    mandatory=true
+    versionRange="[4.4,)"
+    ordering="AFTER"
+    side="BOTH"
+
+[[dependencies.${mod_id}]]
+    modId="curios"
+    mandatory=true
+    versionRange="[5.4,)"
+    ordering="AFTER"
+    side="BOTH"
+
+--- 9.6 src/main/resources/pack.mcmeta ---
+{
+  "pack": {
+    "description": "Aetherium Overlord resources",
+    "pack_format": 15
+  }
+}
+
+--- 9.7 gradle/wrapper/gradle-wrapper.properties ---
+distributionBase=GRADLE_USER_HOME
+distributionPath=wrapper/dists
+distributionUrl=https\://services.gradle.org/distributions/gradle-8.1.1-bin.zip
+zipStoreBase=GRADLE_USER_HOME
+zipStorePath=wrapper/dists
+
+--- 9.8 .gitignore ---
+.gradle/
+build/
+run/
+run-data/
+.idea/
+*.iml
+.vscode/
+eclipse/
+out/
+mcmodsrepo/
+
+--- 9.9 .github/workflows/build.yml ---
+name: Build Mod
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.1.1
+
+      - name: Ensure Gradle wrapper
+        run: |
+          if [ ! -f gradlew ]; then
+            gradle wrapper --gradle-version 8.1.1
+          fi
+          chmod +x gradlew
+
+      - name: Build with Gradle
+        run: ./gradlew build --no-daemon
+
+      - name: Upload JAR as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AetheriumOverlord-jar
+          path: build/libs/*.jar
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Aetherium Overlord build ${{ github.run_number }}
+          files: build/libs/*.jar
+          prerelease: false
+
+--- 9.10 ПОШАГОВАЯ ИНСТРУКЦИЯ (5 шагов) ---
+ ШАГ 1. На github.com нажмите "+" → "New repository", название aetherium-overlord, Public (или Private), создайте репозиторий.
+ ШАГ 2. Нажмите "uploading an existing file" и перетащите папки src, gradle и файлы build.gradle, gradle.properties, settings.gradle, .gitignore (gradlew/gradlew.bat — если есть). Нажмите "Commit changes" в ветку main.
+ ШАГ 3. Создайте workflow-файл: "Add file" → "Create new file", в поле имени введите .github/workflows/build.yml (слеши создадут папки), вставьте текст из пункта 9.9, нажмите "Commit changes".
+ ШАГ 4. Откройте вкладку "Actions": сборка стартует автоматически после коммита (или нажмите "Run workflow"). Дождитесь зелёной галочки (обычно 3–8 минут).
+ ШАГ 5. Нажмите на завершённый запуск → внизу раздел "Artifacts" → скачайте AetheriumOverlord-jar (zip с .jar). Также jar лежит в разделе "Releases" справа на главной странице репозитория. Положите .jar в папку mods вместе с GeckoLib 4 и Curios (версии из gradle.properties) для Forge 1.20.1.
+
+--- 9.11 ВАЖНЫЕ ЗАМЕЧАНИЯ ---
+ • Если сборка падает на версиях библиотек (geckolib_version / curios_version) — откройте страницы модов на Modrinth/CurseForge, выберите версию для Forge 1.20.1 и поправьте строки в gradle.properties. Репозитории Maven в build.gradle уже подключены.
+ • Все ресурсы (текстуры, модели блоков, blockstates) нужно создать вручную — код их не генерирует. Без них мод соберётся и запустится, но с "заглушками" вместо текстур.
+ • Квесты FTB: FTB Quests — отдельный мод, ставится в сборку игры (не в зависимости компиляции).
+ • Разделы 1–2, 5, 8 — рабочий каркас кода; боссы, структуры, Алтарь слияния (BlockEntity + рецепты) и остальные 100+ предметов/блоков нужно добавлять по образцам ModItems/ModBlocks.
+ • API GeckoLib 4 может немного отличаться между 4.x версиями: при ошибках компиляции CrystalStaffItem сверьтесь с вики GeckoLib 4 (Items) для вашей версии.
+================================================================
+КОНЕЦ ДОКУМЕНТА
+================================================================
