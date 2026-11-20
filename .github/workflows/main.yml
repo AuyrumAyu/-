@@ -1,0 +1,38 @@
+name: Build Minecraft Mod
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch: # Позволяет запускать сборку вручную кнопкой на сайте GitHub
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Скачивание кода из репозитория
+        uses: actions/checkout@v4
+
+      - name: Установка Java 17 (требуется для MC 1.20.1)
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Выдача прав на запуск gradlew
+        run: chmod +x gradlew
+
+      - name: Кэширование зависимостей Gradle (ускоряет будущие сборки)
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Компиляция мода (.jar)
+        run: ./gradlew build
+
+      - name: Загрузка готового .jar файла в Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: AetheriumOverlord-Mod-1.20.1
+          path: |
+            build/libs/*.jar
+            !build/libs/*-sources.jar
+            !build/libs/*-slim.jar
